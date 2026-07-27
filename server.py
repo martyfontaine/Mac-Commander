@@ -533,18 +533,33 @@ def _summarize(steps: list) -> str:
 # Tools
 # --------------------------------------------------------------------------
 
-mcp = FastMCP("mac-commander")
+mcp = FastMCP(
+    "mac-commander",
+    instructions=(
+        "Controls the macOS desktop GUI: look at what is on screen, click "
+        "buttons, type text, press keyboard shortcuts, manage app windows, "
+        "post notifications and run AppleScript. Use it to automate any Mac "
+        "application that has no API. The usual sequence is see() to find "
+        "elements, then act() to drive them. It does not read or write files "
+        "and does not run shell commands."
+    ),
+)
 
 
 @mcp.tool()
 def see(app: str | None = None, all: bool = False, vision: bool = False,
         max_elements: int = 150) -> Any:
-    """Accessibility snapshot of one app (default: the frontmost one).
+    """Look at what is on screen in a macOS app — read its windows, buttons,
+    text fields, menus and links through the Accessibility API.
 
-    Returns the frontmost app, the target app's windows, and its interactive
-    elements with stable refs ("e17") usable by act(). Scoped to one app unless
-    all=True. vision=True also captures a screenshot (Screen Recording
-    permission required).
+    Call this before act() to find things to click or type into: it returns
+    stable refs ("e17") that act() accepts. Also use it to check whether a
+    dialog opened, what a window is titled, or whether a button is enabled.
+
+    Scoped to one app — the frontmost one unless you name another — because a
+    whole-desktop dump leaks every window title into the transcript. all=True
+    is the explicit opt-in. vision=True adds a screenshot of the app's window
+    (needs Screen Recording; without it you still get the tree plus a note).
     """
     notes: list[str] = []
     if not AS.AXIsProcessTrusted():
@@ -617,16 +632,22 @@ def _screenshot(running) -> str | None:
 
 @mcp.tool()
 def act(target: str, steps: list[dict], settle_ms: int = 150) -> dict:
-    """Run a batch of input steps against one app, atomically and focus-guarded.
+    """Control a macOS app — click buttons, type text, press keyboard
+    shortcuts, scroll and drag — as one atomic, focus-guarded batch.
+
+    This is the tool for driving any Mac GUI: filling in a form, pressing
+    cmd+s, selecting and copying, choosing a menu item, dragging a file.
+    Call see() first to get refs for the things you want to hit.
 
     Every step verifies `target` is frontmost immediately before firing and
-    again immediately after. If anything steals focus mid-batch the remaining
-    steps are abandoned and the result names the step and the thief.
+    again immediately after, so input can never land in the wrong window. If
+    anything steals focus mid-batch the remaining steps are abandoned and the
+    result names the step and the thief.
 
     Step kinds (each a dict with "kind"):
       click  {ref|xy, button:"left"|"right", clicks:1|2}
-      type   {text, submit:false}
-      key    {combo}   e.g. "cmd+a", "cmd+shift+4"
+      type   {text, submit:false}    full Unicode: é — " ' 🙂 all survive
+      key    {combo}   e.g. "cmd+a", "cmd+shift+4", "return", "escape"
       scroll {ref|xy, dx, dy}
       drag   {from_ref|from_xy, to_ref|to_xy}
       wait   {ms}      capped at 10000
@@ -722,11 +743,17 @@ def _place_window(pid: int, window: dict) -> str:
 
 @mcp.tool()
 def app(action: str, name: str, window: dict | None = None) -> dict:
-    """Manage an application: launch | quit | switch | hide.
+    """Launch, quit, switch to or hide a macOS application, and move or resize
+    its window.
 
-    `name` is an app name or bundle id. quit is a graceful terminate — this
-    server never force-kills. `window` optionally repositions the app's front
-    window: {"move": [x, y], "size": [w, h]}.
+    action is "launch" | "quit" | "switch" | "hide". `name` is an app name
+    ("Safari") or a bundle id ("com.apple.Safari"). Use "switch" to bring an
+    app to the front before act(), and "launch" if it is not running yet.
+
+    quit is a graceful terminate that waits for the process to actually exit —
+    it never force-kills, and says so if a save dialog is holding it open.
+    `window` optionally places the front window: {"move": [x, y],
+    "size": [w, h]}.
     """
     action = str(action).strip().lower()
     if action not in ("launch", "quit", "switch", "hide"):
@@ -801,8 +828,12 @@ def app(action: str, name: str, window: dict | None = None) -> dict:
 @mcp.tool()
 def notify(message: str, title: str = "Mac-Commander", subtitle: str | None = None,
            sound: str | None = None) -> dict:
-    """Post a macOS notification banner. Handles any Unicode — quotes, em
-    dashes, emoji — because nothing is interpolated into the script."""
+    """Show a macOS notification banner to get the user's attention.
+
+    Use it to tell them a long job has finished, that something needs a
+    decision, or that a run failed. Any Unicode is safe — quotes, em dashes,
+    accents and emoji all pass through untouched.
+    """
     result = osa(NOTIFY_SCRIPT, [message, title, subtitle or "", sound or ""], timeout=15)
     ok = result["exit_code"] == 0
     audit("notify", title, message[:120], "ok" if ok else f"error: {result['stderr'][:200]}")
@@ -811,9 +842,17 @@ def notify(message: str, title: str = "Mac-Commander", subtitle: str | None = No
 
 @mcp.tool()
 def applescript(script: str, args: list[str] | None = None, timeout: int = 30) -> dict:
-    """Run an AppleScript. The script is passed through untouched on stdin;
-    `args` arrive as argv, so write it with an `on run argv` handler and read
-    values from there. Never build a script by concatenating user data."""
+    """Run an AppleScript / osascript for anything the other tools do not
+    cover — Finder, Mail, Music, Reminders, Calendar, System Events, or any
+    app with a scripting dictionary.
+
+    The script is passed through untouched on stdin and `args` arrive as argv,
+    so write it with an `on run argv` handler and read your values from there.
+    Never concatenate data into the script text: an embedded quote or em dash
+    is exactly the failure this server exists to remove.
+
+    Returns stdout, stderr and the exit code.
+    """
     args = [str(a) for a in (args or [])]
     result = osa(script, args, timeout=timeout)
     first_line = script.strip().splitlines()[0][:80] if script.strip() else "(empty)"
