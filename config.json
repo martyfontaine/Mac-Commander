@@ -1,0 +1,8 @@
+{
+  "input_blocklist": [
+    "1Password",
+    "Passwords",
+    "System Settings"
+  ],
+  "audit_log": "audit.jsonl"
+}
