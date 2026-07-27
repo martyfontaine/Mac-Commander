@@ -30,7 +30,7 @@ no secrets in the working tree or in any of the 6 commits of history;
 
 | ID | file:line | Sev | What | Why it matters here | Status | Verified |
 |----|-----------|-----|------|---------------------|--------|----------|
-| A-001 | server.py:543 (instructions), :843 (tool); README.md:5 | Critical | The server's own MCP instructions and README stated it "does not read or write files and does not run shell commands", while `applescript()` runs arbitrary AppleScript — reaching the shell via `do shell script`, reading and writing files, and bound by neither the blocklist nor the focus guard. | The instructions string is text the **model** reads to decide what is safe to call. A false capability claim makes it treat an unbounded tool as a sandboxed one. Both auditors independently ranked this first; Codex rated it Critical. | FIXED@9362b86 (claim) · FIXED@5421baa (contained) | Executed `do shell script "echo …; id -un"` through `osa()` — exit 0, returned the username. Now refused by default: `verify.py` test 2b and 8 hermetic tests, including one asserting a refused script never reaches osascript. |
+| A-001 | server.py:543 (instructions), :843 (tool); README.md:5 | Critical | The server's own MCP instructions and README stated it "does not read or write files and does not run shell commands", while `applescript()` runs arbitrary AppleScript — reaching the shell via `do shell script`, reading and writing files, and bound by neither the blocklist nor the focus guard. | The instructions string is text the **model** reads to decide what is safe to call. A false capability claim makes it treat an unbounded tool as a sandboxed one. Both auditors independently ranked this first; Codex rated it Critical. | FIXED@9362b86 (claim) · FIXED@a4d9893 (contained) | Executed `do shell script "echo …; id -un"` through `osa()` — exit 0, returned the username. Now refused by default: `verify.py` test 2b and 8 hermetic tests, including one asserting a refused script never reaches osascript. |
 | A-002 | server.py:613-630 | High | `see(app=X, vision=True)` silently captured the entire screen whenever no layer-0 window could be found for X; nothing in the payload said the scope had widened. | Routine trigger (app hidden, minimised or windowless), and README promised "of the target app's window …, not the whole screen". Hands back every other visible window — the exact whole-desktop leak scoping exists to prevent. | FIXED@9362b86 | `test_scoped_capture_refuses_rather_than_grabbing_the_whole_screen` fails the test if `screencapture` is invoked unscoped for a named app. |
 | A-003 | server.py:617 | Medium | Every `see(vision=True)` wrote a PNG of the screen into a fresh `mkdtemp` directory that nothing ever deleted. | Screen contents at rest, accumulating for the life of the machine. `Image(path=)` reads lazily after return, so the file could not simply be unlinked — bytes are now read up front and passed as `Image(data=)`. | FIXED@9362b86 | `test_capture_removes_its_temp_directory` asserts the directory is gone before return. |
 | A-004 | server.py:858 | Medium | Every `applescript` audit line recorded the literal string `on run argv` — the documented mandatory first line — plus an argument count. Nothing about what ran. | The append-only log is the *only* detective control over the one tool that can do arbitrary damage. 50 existing log lines confirmed: every applescript row identical. A clipboard read and an exfiltration script were indistinguishable. | FIXED@9362b86 | `test_script_fingerprint_distinguishes_scripts`; visible live in `verify.py` output as `sha256:1c16b4b068a21152 43c/3L return item 1 of argv`. |
@@ -122,7 +122,7 @@ later reader can see what the decision was made against.
 No code change; the screenshot refusal from 9362b86 stands. Status closed.
 
 **A-001 → Marty chose containment and delegated the design.** Implemented in
-5421baa as a who-writes-it boundary rather than a what-it-does one: scripts live
+a4d9893 as a who-writes-it boundary rather than a what-it-does one: scripts live
 in `scripts/`, the model selects by name and supplies argv, and raw script text
 needs `"allow_raw_applescript": true` (default false). SPEC.md carries an
 amendment note, since this supersedes the v1.0 signature. Rationale for
@@ -159,7 +159,7 @@ and blocklisted app names.
 - *Recommendation at the time:* keep the tool unrestricted and accurately
   described, or redesign to an allowlist if containment is wanted.
 
-**What was built (5421baa).** A third option, chosen over both of the above.
+**What was built (a4d9893).** A third option, chosen over both of the above.
 A shipped-template allowlist would have been too rigid — the tool exists
 precisely for what the other four cannot do, and a fixed catalogue cannot
 anticipate that. A text scanner was rejected for the reason given above. The
@@ -195,7 +195,7 @@ macOS would make it one.
 
 - **The security model was one tool wide; it no longer is.** Four tools were
   carefully bounded and the fifth was unbounded, so the effective posture of
-  the server was "whatever AppleScript can do". After 5421baa the default
+  the server was "whatever AppleScript can do". After a4d9893 the default
   posture is bounded on all five, and the remaining gap is a directory Marty
   controls rather than a tool argument the model controls. The blocklist and
   focus guard still prevent *accidents* rather than a determined adversary —
