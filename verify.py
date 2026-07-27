@@ -69,16 +69,29 @@ def test_1_notify() -> None:
 
 # -- 2 -----------------------------------------------------------------------
 def test_2_applescript_roundtrip() -> None:
-    banner("Test 2 — applescript argv round-trip")
-    script = 'on run argv\n\treturn item 1 of argv\nend run\n'
+    banner("Test 2 — applescript argv round-trip via a named script")
+    catalogue = server.applescript()
+    print("  catalogue:", json.dumps(catalogue["scripts"]))
+    print("  raw script text allowed:", catalogue["raw_allowed"])
     arg = 'quote " and em dash — and é and 🙂'
-    result = server.applescript(script=script, args=[arg])
+    result = server.applescript(name="echo-argv", args=[arg])
     print("  arg in :", repr(arg))
     print("  stdout :", repr(result["stdout"]))
     print("  exit   :", result["exit_code"], "stderr:", repr(result["stderr"]))
     ok = result["exit_code"] == 0 and result["stdout"] == arg
     record("2. applescript round-trip", ok,
-           "byte-exact" if ok else "argument did not survive the round-trip")
+           "byte-exact through scripts/echo-argv.applescript"
+           if ok else "argument did not survive the round-trip")
+
+
+def test_2b_raw_script_refused() -> None:
+    banner("Test 2b — model-authored script text is refused by default (A-001)")
+    result = server.applescript(script='on run argv\n\treturn do shell script "id -un"\nend run\n')
+    print("  applescript(script=...):", json.dumps(result, ensure_ascii=False)[:220])
+    ok = result.get("ok") is False and "raw AppleScript is disabled" in result.get("error", "")
+    record("2b. raw script refused", ok,
+           "refused, and the error names the catalogue instead"
+           if ok else "raw script text was NOT refused")
 
 
 # -- 3 -----------------------------------------------------------------------
@@ -121,7 +134,9 @@ def test_4_textedit_end_to_end() -> None:
     print("  TextEdit documents already open:", docs_before)
 
     try:
-        opened = server.applescript(script=TEXTEDIT_NEW)
+        # osa() is the internal primitive; the TextEdit scripts here are test
+        # fixtures, not part of the shipped catalogue.
+        opened = server.osa(TEXTEDIT_NEW, [])
         print("  applescript activate + new document:", json.dumps(opened))
         if opened["exit_code"] != 0:
             record("4. TextEdit end-to-end", False, f"could not open TextEdit: {opened['stderr']}")
@@ -234,6 +249,7 @@ def main() -> int:
 
     test_1_notify()
     test_2_applescript_roundtrip()
+    test_2b_raw_script_refused()
     test_3_see_finder()
     test_4_textedit_end_to_end()
     test_5_blocklist()

@@ -9,5 +9,6 @@
     "Keychain Access",
     "com.apple.keychainaccess"
   ],
-  "audit_log": "audit.jsonl"
+  "audit_log": "audit.jsonl",
+  "allow_raw_applescript": false
 }

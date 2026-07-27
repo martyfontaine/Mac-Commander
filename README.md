@@ -7,12 +7,12 @@ It replaces the third-party **MacOS-MCP** server. Four of its five tools —
 shell commands; Desktop Commander owns that layer. The scope discipline is the
 feature.
 
-`applescript` is the deliberate exception and is **not** bounded by any of
-that. AppleScript reaches the shell through `do shell script`, reads and writes
-files, and can drive apps the blocklist would otherwise refuse — including a
-password manager, with no focus guard. Treat it as full user-level access to
-the machine and prefer the other four whenever they can do the job. See
-[Refusing input to sensitive apps](#refusing-input-to-sensitive-apps).
+`applescript` runs scripts **you** wrote, chosen by name. AppleScript is
+unrestricted once running — it reaches the shell through `do shell script`,
+reads and writes files, and can drive any app — so the code is yours to author
+and the model only picks one and supplies argv. Model-authored script text is
+refused unless you explicitly enable it. See
+[The AppleScript boundary](#the-applescript-boundary).
 
 Built to spec: [`SPEC.md`](SPEC.md) v1.0.
 
@@ -114,11 +114,23 @@ dialog is open.
 
 A notification banner. Any Unicode is safe.
 
-### `applescript(script, args=[], timeout=30)`
+### `applescript(name=None, script=None, args=[], timeout=30)`
 
-Runs your script untouched, with `args` delivered as argv. Write it with an
-`on run argv` handler and read values from there. Returns stdout, stderr and
-exit code.
+Runs one of your scripts from `scripts/`, chosen by name, with `args`
+delivered as argv. Returns stdout, stderr and exit code.
+
+```
+applescript()                                    # the catalogue
+applescript(name="clipboard-read")
+applescript(name="clipboard-write", args=["hi"])
+```
+
+Adding a script is dropping a `.applescript` file in `scripts/` — no restart,
+the catalogue is read per call. Write it with an `on run argv` handler and read
+values from there.
+
+Passing `script=` instead is refused unless `config.json` sets
+`"allow_raw_applescript": true`.
 
 ## Why AppleScript is never interpolated
 
@@ -165,9 +177,31 @@ bundle id (`com.apple.systempreferences`) shares no substring with its English
 name, so the name alone would guard nothing there.
 
 **What the blocklist does not cover.** It gates input through `act()` and
-screenshots through `see(vision=true)`. It does not gate the element tree, and
-`applescript` bypasses it entirely — AppleScript can drive any app. The
-blocklist raises the cost of an accident; it is not a containment boundary.
+screenshots through `see(vision=true)`. It does not gate the element tree —
+reading a locked vault is harmless and sometimes useful — and a script in
+`scripts/` can drive any app, because you wrote it.
+
+## The AppleScript boundary
+
+AppleScript cannot be sandboxed: it reaches the shell, the filesystem and every
+scriptable app, and any check on script *text* is defeated by building the
+string at runtime. So the boundary is not what a script may do — it is **who
+writes it**.
+
+The threat model's adversary is a prompt-injected model, not you. So:
+
+- **You** author scripts in `scripts/`. They run unrestricted. Adding one is
+  the same decision as running it yourself.
+- **The model** picks one by name and supplies `args`. It cannot author code.
+
+That is the argv discipline this server already applied to data, extended to
+code: values never get interpolated into a script, and now neither does the
+script get authored by the caller.
+
+`"allow_raw_applescript": true` in `config.json` restores the old behaviour and
+hands the model arbitrary code execution as you. It exists because it is
+sometimes what you want during development; it is off by default, and every
+refused attempt is logged with the script's fingerprint.
 
 ## Audit log
 

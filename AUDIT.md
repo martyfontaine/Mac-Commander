@@ -30,7 +30,7 @@ no secrets in the working tree or in any of the 6 commits of history;
 
 | ID | file:line | Sev | What | Why it matters here | Status | Verified |
 |----|-----------|-----|------|---------------------|--------|----------|
-| A-001 | server.py:543 (instructions), :843 (tool); README.md:5 | Critical | The server's own MCP instructions and README stated it "does not read or write files and does not run shell commands", while `applescript()` runs arbitrary AppleScript — reaching the shell via `do shell script`, reading and writing files, and bound by neither the blocklist nor the focus guard. | The instructions string is text the **model** reads to decide what is safe to call. A false capability claim makes it treat an unbounded tool as a sandboxed one. Both auditors independently ranked this first; Codex rated it Critical. | FIXED@9362b86 | Executed `do shell script "echo …; id -un"` through `osa()` — exit 0, returned the username. Post-fix asserted by `test_instructions_do_not_claim_the_server_cannot_run_shell_commands` and `test_applescript_docstring_warns_it_is_unbounded`. |
+| A-001 | server.py:543 (instructions), :843 (tool); README.md:5 | Critical | The server's own MCP instructions and README stated it "does not read or write files and does not run shell commands", while `applescript()` runs arbitrary AppleScript — reaching the shell via `do shell script`, reading and writing files, and bound by neither the blocklist nor the focus guard. | The instructions string is text the **model** reads to decide what is safe to call. A false capability claim makes it treat an unbounded tool as a sandboxed one. Both auditors independently ranked this first; Codex rated it Critical. | FIXED@9362b86 (claim) · FIXED@5421baa (contained) | Executed `do shell script "echo …; id -un"` through `osa()` — exit 0, returned the username. Now refused by default: `verify.py` test 2b and 8 hermetic tests, including one asserting a refused script never reaches osascript. |
 | A-002 | server.py:613-630 | High | `see(app=X, vision=True)` silently captured the entire screen whenever no layer-0 window could be found for X; nothing in the payload said the scope had widened. | Routine trigger (app hidden, minimised or windowless), and README promised "of the target app's window …, not the whole screen". Hands back every other visible window — the exact whole-desktop leak scoping exists to prevent. | FIXED@9362b86 | `test_scoped_capture_refuses_rather_than_grabbing_the_whole_screen` fails the test if `screencapture` is invoked unscoped for a named app. |
 | A-003 | server.py:617 | Medium | Every `see(vision=True)` wrote a PNG of the screen into a fresh `mkdtemp` directory that nothing ever deleted. | Screen contents at rest, accumulating for the life of the machine. `Image(path=)` reads lazily after return, so the file could not simply be unlinked — bytes are now read up front and passed as `Image(data=)`. | FIXED@9362b86 | `test_capture_removes_its_temp_directory` asserts the directory is gone before return. |
 | A-004 | server.py:858 | Medium | Every `applescript` audit line recorded the literal string `on run argv` — the documented mandatory first line — plus an argument count. Nothing about what ran. | The append-only log is the *only* detective control over the one tool that can do arbitrary damage. 50 existing log lines confirmed: every applescript row identical. A clipboard read and an exfiltration script were indistinguishable. | FIXED@9362b86 | `test_script_fingerprint_distinguishes_scripts`; visible live in `verify.py` output as `sha256:1c16b4b068a21152 43c/3L return item 1 of argv`. |
@@ -58,7 +58,8 @@ no secrets in the working tree or in any of the 6 commits of history;
 | A-026 | config.json | Info | `config.json` is committed, so `_load_config`'s auto-create branch is unreachable in a fresh clone — and a committed config **overrides** `DEFAULT_CONFIG` wholesale. | Found by testing the A-006 fix: editing `DEFAULT_CONFIG` alone changed nothing, because the shipped file replaced the list. Anyone hardening the defaults must edit both. | FIXED@9362b86 | Both updated; `blocklist_hit` re-verified against the loaded config. |
 
 **Severity counts:** 1 Critical · 1 High · 10 Medium · 10 Low · 4 Info.
-**Status counts:** 22 FIXED · 1 PROPOSED · 1 DEFERRED · 1 USER-DECISION (A-005, partially fixed).
+**Status counts:** 23 FIXED · 1 PROPOSED (A-022) · 1 DEFERRED (A-024).
+Both user decisions were resolved on the day — see Conflicts.
 
 ## Reconciliation
 
@@ -111,7 +112,21 @@ and a world-readable-log finding whose stated impact did not hold on a
 single-user Mac. Those are the shape of false positive this process is meant to
 catch before it reaches this table.
 
-### Conflicts (user decision)
+### Conflicts — resolved by Marty, 2026-07-27
+
+Both were put to Marty and both came back the same day. His answers and what
+was done are recorded under each. The original arguments are kept verbatim so a
+later reader can see what the decision was made against.
+
+**A-005 → Marty took the recommendation: leave the element tree readable.**
+No code change; the screenshot refusal from 9362b86 stands. Status closed.
+
+**A-001 → Marty chose containment and delegated the design.** Implemented in
+5421baa as a who-writes-it boundary rather than a what-it-does one: scripts live
+in `scripts/`, the model selects by name and supplies argv, and raw script text
+needs `"allow_raw_applescript": true` (default false). SPEC.md carries an
+amendment note, since this supersedes the v1.0 signature. Rationale for
+preferring this over the two alternatives is below.
 
 **A-005 — should `see()` refuse blocklisted apps entirely?**
 The screenshot half is fixed: writing a bitmap of a password manager to disk
@@ -141,22 +156,50 @@ and blocklisted app names.
   evaded — `tell application (item 1 of argv)`, `run script`, or any string
   built at runtime. A control that looks like a boundary but is not is worse
   than an honestly documented gap, because it invites reliance.
-- *Recommendation:* keep the tool unrestricted and now-accurately described,
-  which is what was implemented. If you want real containment, the effective
-  version is an **allowlist** of named script templates the server ships,
-  with `applescript()` reduced to choosing one and supplying argv — a
-  significant redesign, and a genuine change to what the tool is for. That is
-  yours to decide, not mine to apply.
+- *Recommendation at the time:* keep the tool unrestricted and accurately
+  described, or redesign to an allowlist if containment is wanted.
+
+**What was built (5421baa).** A third option, chosen over both of the above.
+A shipped-template allowlist would have been too rigid — the tool exists
+precisely for what the other four cannot do, and a fixed catalogue cannot
+anticipate that. A text scanner was rejected for the reason given above. The
+implemented boundary is neither:
+
+> AppleScript cannot be sandboxed, and any check on script *text* is defeated
+> by building the string at runtime. So the boundary is not what a script may
+> do — it is **who writes it**. The adversary is a prompt-injected model, not
+> Marty. Scripts in `scripts/` are user-authored and run unrestricted; the
+> model may only pick one by name and supply argv.
+
+This keeps full expressive power (Marty can write any script, and adding one is
+dropping a file in a directory — no restart, the catalogue is read per call)
+while removing the injected model's ability to author code. It is the same
+argv discipline the server already applied to *data*, extended to *code*.
+
+The escape hatch is deliberate and deliberately loud: `allow_raw_applescript`
+restores the old behaviour for development, defaults to false, and every
+refused attempt is audited with the script's fingerprint — visible in
+`audit.jsonl` as `refused: raw script text disabled` alongside a sha256 of what
+was attempted.
+
+*Residual risk, stated plainly:* a script in `scripts/` is unrestricted once it
+runs, so a model that can persuade Marty to add a file, or that reaches the
+filesystem through another tool (Desktop Commander can write files), is not
+contained by this. The boundary raises the bar from "one tool call" to "get a
+file into a reviewed directory"; it is not a sandbox, and nothing available on
+macOS would make it one.
 
 ## Bigger picture
 
 *Project-level observations, explicitly not findings and not counted above.*
 
-- **The security model is one tool wide.** Four tools are carefully bounded and
-  the fifth is unbounded, which means the effective posture of this server is
-  "whatever AppleScript can do". That is a defensible design for a personal
-  tool, but the honest framing is that the blocklist and focus guard prevent
-  *accidents*, not a determined injected model. The docs now say so.
+- **The security model was one tool wide; it no longer is.** Four tools were
+  carefully bounded and the fifth was unbounded, so the effective posture of
+  the server was "whatever AppleScript can do". After 5421baa the default
+  posture is bounded on all five, and the remaining gap is a directory Marty
+  controls rather than a tool argument the model controls. The blocklist and
+  focus guard still prevent *accidents* rather than a determined adversary —
+  the docs say so plainly now.
 - **`server.py` is 1050 lines against SPEC's 600–900 budget.** The audit fixes
   added ~190 lines net. I did not delete security code to satisfy a line count,
   and I flag rather than silently bust the spec. If the budget matters more
@@ -168,6 +211,10 @@ and blocklisted app names.
   once on a macOS Automation consent dialog, which looks exactly like a code
   regression until you check. The hermetic suite added here is what should gate
   changes; `verify.py` is an acceptance ritual, not a regression net.
+- **`scripts/` is now the thing to guard.** The audit moved the trust boundary
+  onto a directory, which is a better place for it but not a free one: anything
+  landing there runs unrestricted. Worth reviewing it the way you would review
+  a crontab, and worth noticing that Desktop Commander can write to it.
 - **Consider whether `applescript` needs to be in the same server.** Splitting
   it into a separate MCP server would let Claude Desktop grant or withhold it
   independently, which is the only way "four bounded tools" becomes a property

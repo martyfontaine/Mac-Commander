@@ -209,11 +209,88 @@ def test_unknown_app_action_is_audited(monkeypatch):
 
 def test_instructions_do_not_claim_the_server_cannot_run_shell_commands():
     text = server.mcp.instructions
+    # The original sentence claimed the whole server could not reach the shell.
     assert "does not read or write files and does not run shell commands." not in text
-    assert "applescript() is the exception" in text
+    # It must say who authors the code and that raw text is gated.
+    assert "scripts the user wrote" in text
+    assert "refused unless the user has explicitly enabled it" in text
 
 
-def test_applescript_docstring_warns_it_is_unbounded():
+def test_applescript_docstring_states_who_authors_the_code():
     doc = server.applescript.__doc__ or ""
-    assert "UNBOUNDED BY DESIGN" in doc
     assert "do shell script" in doc
+    assert "allow_raw_applescript" in doc
+
+
+# -- A-001 redesign: the model picks a script, the user writes it --
+
+def test_raw_script_text_is_refused_by_default(monkeypatch):
+    monkeypatch.setitem(server.CONFIG, "allow_raw_applescript", False)
+    called = []
+    monkeypatch.setattr(server, "osa", lambda *a, **k: called.append(a) or {})
+    result = server.applescript(script='on run argv\n\tdo shell script "id -un"\nend run\n')
+    assert result["ok"] is False
+    assert "raw AppleScript is disabled" in result["error"]
+    assert not called, "a refused script must never reach osascript"
+
+
+def test_raw_script_refusal_is_audited(monkeypatch):
+    monkeypatch.setitem(server.CONFIG, "allow_raw_applescript", False)
+    lines = []
+    monkeypatch.setattr(server, "audit", lambda *a: lines.append(a))
+    server.applescript(script='on run argv\n\treturn 1\nend run\n')
+    assert lines and "refused" in lines[-1][-1]
+
+
+def test_raw_script_runs_when_the_user_has_enabled_it(monkeypatch):
+    monkeypatch.setitem(server.CONFIG, "allow_raw_applescript", True)
+    monkeypatch.setattr(server, "osa",
+                        lambda *a, **k: {"exit_code": 0, "stdout": "ran", "stderr": ""})
+    result = server.applescript(script='on run argv\n\treturn 1\nend run\n')
+    assert result["ok"] is True and result["stdout"] == "ran"
+
+
+def test_named_script_runs_and_is_labelled_by_name(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(server, "osa",
+                        lambda text, args, **k: seen.update(text=text, args=args)
+                        or {"exit_code": 0, "stdout": "x", "stderr": ""})
+    lines = []
+    monkeypatch.setattr(server, "audit", lambda *a: lines.append(a))
+    result = server.applescript(name="echo-argv", args=["hello"])
+    assert result["ok"] is True
+    assert "on run argv" in seen["text"], "the file's text should reach osascript"
+    assert seen["args"] == ["hello"]
+    assert lines[-1][1] == "script:echo-argv"
+
+
+@pytest.mark.parametrize("name", [
+    "../server", "/etc/passwd", "~/secret", "sub/dir", "..", "nope\\evil",
+])
+def test_named_script_rejects_paths(name):
+    text, error = server._named_script(name)
+    assert text is None and error
+
+
+def test_unknown_script_name_lists_the_catalogue():
+    result = server.applescript(name="does-not-exist")
+    assert result["ok"] is False
+    assert "no script named" in result["error"]
+    assert "echo-argv" in result["scripts"]
+
+
+def test_bare_call_returns_the_catalogue():
+    result = server.applescript()
+    assert result["ok"] is True
+    for expected in ("echo-argv", "clipboard-read", "clipboard-write"):
+        assert expected in result["scripts"]
+    assert result["raw_allowed"] is False
+
+
+def test_shipped_scripts_all_declare_an_argv_handler():
+    names = server._script_catalogue()
+    assert names, "the catalogue must not be empty"
+    for n in names:
+        text, error = server._named_script(n)
+        assert error is None
+        assert "on run argv" in text, f"{n} must take its values as argv"

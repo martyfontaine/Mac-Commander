@@ -46,6 +46,10 @@ DEFAULT_CONFIG = {
         "Keychain Access", "com.apple.keychainaccess",
     ],
     "audit_log": "audit.jsonl",
+    # Model-authored AppleScript is refused by default: it reaches the shell via
+    # `do shell script` and is bound by neither the blocklist nor the focus
+    # guard. Scripts in scripts/ are written by the user and run by name.
+    "allow_raw_applescript": False,
 }
 
 
@@ -592,6 +596,35 @@ def execute_step(step: dict, pid: int) -> str:
     raise ValueError(f"unknown step kind {kind!r}")
 
 
+SCRIPTS_DIR = ROOT / "scripts"
+
+
+def _script_catalogue() -> list[str]:
+    """Names of the user-authored scripts that applescript() will run."""
+    if not SCRIPTS_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in SCRIPTS_DIR.glob("*.applescript"))
+
+
+def _named_script(name: str) -> tuple[str | None, str | None]:
+    """Read scripts/<name>.applescript. Returns (text, error).
+
+    The name indexes a directory, so it is a bare stem: separators, "..", "~"
+    and absolute forms are refused before any path is built, for the same
+    reason _app_url() refuses them.
+    """
+    if not name or "/" in name or "\\" in name or ".." in name or name.startswith("~"):
+        return None, f"invalid script name {name!r}: use a bare name from the catalogue"
+    path = SCRIPTS_DIR / f"{name}.applescript"
+    if not path.is_file():
+        return None, (f"no script named {name!r}. Available: "
+                      f"{', '.join(_script_catalogue()) or '(none)'}")
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except OSError as exc:
+        return None, f"could not read script {name!r}: {exc}"
+
+
 def _script_fingerprint(script: str) -> str:
     """Identify an AppleScript in the audit log without transcribing it.
 
@@ -639,11 +672,12 @@ mcp = FastMCP(
         "Scope, stated accurately: see(), act(), app() and notify() do not read "
         "or write files and do not run shell commands, and act() additionally "
         "refuses blocklisted apps and verifies focus around every step. "
-        "applescript() is the exception and is not bounded by any of that — "
-        "AppleScript can run shell commands via `do shell script`, read and "
-        "write files, and drive apps the blocklist would otherwise refuse. "
-        "Treat applescript() as full user-level access to the machine and "
-        "prefer the other four tools whenever they can do the job."
+        "applescript() runs scripts the user wrote and keeps in scripts/, "
+        "chosen by name — call it with no arguments to see the catalogue. "
+        "Those scripts are unrestricted once running (AppleScript reaches the "
+        "shell and any app), so they are the user's to author: you choose one "
+        "and supply argv, you do not write the code. Supplying raw script text "
+        "is refused unless the user has explicitly enabled it in config.json."
     ),
 )
 
@@ -1015,35 +1049,62 @@ def notify(message: str, title: str = "Mac-Commander", subtitle: str | None = No
 
 
 @mcp.tool()
-def applescript(script: str, args: list[str] | None = None, timeout: int = 30) -> dict:
-    """Run an AppleScript / osascript for anything the other tools do not
-    cover — Finder, Mail, Music, Reminders, Calendar, System Events, or any
-    app with a scripting dictionary.
+def applescript(name: str | None = None, script: str | None = None,
+                args: list[str] | None = None, timeout: int = 30) -> dict:
+    """Run one of the user's AppleScripts by name — for anything the other
+    tools do not cover: Finder, Mail, Music, Reminders, Calendar, System
+    Events, or any app with a scripting dictionary.
 
-    UNBOUNDED BY DESIGN. Unlike the other four tools this one applies no
-    blocklist, no focus guard and no scope limit. AppleScript reaches the shell
-    through `do shell script`, reads and writes files, and can drive apps that
-    act() would refuse — including a password manager. It is full user-level
-    access to the machine, so reach for see()/act()/app()/notify() first and use
-    this only for what they genuinely cannot do.
+    Call with no arguments to get the catalogue of available scripts.
 
-    The script is passed through untouched on stdin and `args` arrive as argv,
-    so write it with an `on run argv` handler and read your values from there.
-    Never concatenate data into the script text: an embedded quote or em dash
-    is exactly the failure this server exists to remove.
+    `name` picks a script the user wrote and reviewed in scripts/; `args` are
+    delivered to its `on run argv` handler as argv, so any value is safe —
+    quotes, em dashes, accents and emoji all survive untouched.
 
-    The audit log records a sha256 of the script, its size and its first body
-    line — enough to identify a script later, without transcribing whatever it
-    contains.
+        applescript()                                    -> list what is available
+        applescript(name="clipboard-read")
+        applescript(name="clipboard-write", args=["hi"])
+
+    You cannot supply script text yourself unless the user has set
+    "allow_raw_applescript": true in config.json. This is deliberate:
+    AppleScript reaches the shell through `do shell script`, reads and writes
+    files, and is bound by neither the blocklist nor the focus guard, so
+    model-authored script text is full user-level access to the machine. If a
+    task needs a script that does not exist yet, say so and ask the user to add
+    it to scripts/ — do not ask them to enable raw execution.
 
     Returns stdout, stderr and the exit code.
     """
     args = [str(a) for a in (args or [])]
-    result = osa(script, args, timeout=timeout)
-    audit("applescript", _script_fingerprint(script),
+
+    if not name and not script:
+        return {"ok": True, "scripts": _script_catalogue(),
+                "raw_allowed": bool(CONFIG.get("allow_raw_applescript")),
+                "hint": "call applescript(name=..., args=[...]); add new scripts "
+                        f"to {SCRIPTS_DIR}"}
+
+    if name:
+        text, error = _named_script(str(name))
+        if text is None:
+            audit("applescript", f"script:{name}", f"{len(args)} args", f"error: {error}")
+            return {"ok": False, "error": error, "scripts": _script_catalogue()}
+        label = f"script:{name}"
+    else:
+        if not CONFIG.get("allow_raw_applescript"):
+            error = ("raw AppleScript is disabled. Use applescript(name=...) with one "
+                     "of the user's reviewed scripts, or ask the user to add a new one "
+                     f"to {SCRIPTS_DIR}. Available: "
+                     f"{', '.join(_script_catalogue()) or '(none)'}")
+            audit("applescript", _script_fingerprint(script or ""),
+                  f"{len(args)} args", "refused: raw script text disabled")
+            return {"ok": False, "error": error, "scripts": _script_catalogue()}
+        text, label = script or "", _script_fingerprint(script or "")
+
+    result = osa(text, args, timeout=timeout)
+    audit("applescript", label,
           f"{len(args)} args, {sum(len(a) for a in args)} arg chars",
           "ok" if result["exit_code"] == 0 else f"exit {result['exit_code']}: {result['stderr'][:200]}")
-    return result
+    return {"ok": result["exit_code"] == 0, **result}
 
 
 if __name__ == "__main__":
