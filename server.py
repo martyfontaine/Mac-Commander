@@ -251,10 +251,16 @@ def _snapshot(running, budget: dict) -> dict:
 _WS = AppKit.NSWorkspace.sharedWorkspace()
 
 
-def frontmost() -> dict:
-    """Who owns the keyboard right now. Pumping the run loop keeps NSWorkspace
-    current in a process that has no run loop of its own."""
+def _pump() -> None:
+    """NSWorkspace's app list, frontmostApplication and isTerminated are all
+    KVO-updated. In a process with no run loop of its own they go stale — an
+    app launched a second ago stays invisible — so pump before every read."""
     CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.02, False)
+
+
+def frontmost() -> dict:
+    """Who owns the keyboard right now."""
+    _pump()
     app = _WS.frontmostApplication()
     if app is None:
         return {"name": None, "bundle_id": None, "pid": None}
@@ -266,6 +272,7 @@ def frontmost() -> dict:
 
 
 def _running_apps() -> list:
+    _pump()
     return list(_WS.runningApplications() or [])
 
 
@@ -276,7 +283,7 @@ def find_running(name: str):
         return None
     needle = name.strip().lower()
     ranked = sorted(
-        _running_apps(),
+        [a for a in _running_apps() if not a.isTerminated()],
         key=lambda a: 0 if a.activationPolicy() == AppKit.NSApplicationActivationPolicyRegular else 1,
     )
     for test in (
@@ -757,7 +764,17 @@ def app(action: str, name: str, window: dict | None = None) -> dict:
     if action == "quit":
         result["ok"] = bool(running.terminate())  # graceful only, never forceTerminate
         if not result["ok"]:
-            result["error"] = "terminate request was refused (unsaved changes?)"
+            result["error"] = "terminate request was refused"
+        else:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not running.isTerminated():
+                _pump()
+                time.sleep(0.1)
+            result["terminated"] = bool(running.isTerminated())
+            if not result["terminated"]:
+                result["ok"] = False
+                result["error"] = ("quit was requested but the app is still running — "
+                                   "it is probably showing a save or confirm dialog")
     elif action == "switch":
         running.activateWithOptions_(AppKit.NSApplicationActivateAllWindows)
         thief = wait_frontmost(int(running.processIdentifier()), 3.0)
@@ -765,7 +782,14 @@ def app(action: str, name: str, window: dict | None = None) -> dict:
             result["ok"] = False
             result["error"] = f"did not come to the front within 3s; {thief['name']} has focus"
     elif action == "hide":
-        result["ok"] = bool(running.hide())
+        running.hide()  # its BOOL return says NO even on success; trust the state instead
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not running.isHidden():
+            _pump()
+            time.sleep(0.1)
+        result["ok"] = bool(running.isHidden())
+        if not result["ok"]:
+            result["error"] = "hide was requested but the app is still visible"
 
     if window and action != "quit":
         result["window"] = _place_window(int(running.processIdentifier()), window)
