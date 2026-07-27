@@ -14,8 +14,10 @@ Two rules shape every line below:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,7 +35,16 @@ from mcp.server.fastmcp import FastMCP, Image
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = {
-    "input_blocklist": ["1Password", "Passwords", "System Settings"],
+    # Display names AND bundle ids. Display names are localized — on a French
+    # Mac "System Settings" is "Réglages Système" — and that app's bundle id
+    # (com.apple.systempreferences) shares no substring with its English name,
+    # so both forms are needed for the guard to hold outside English.
+    "input_blocklist": [
+        "1Password", "com.1password.",
+        "Passwords", "com.apple.Passwords",
+        "System Settings", "com.apple.systempreferences",
+        "Keychain Access", "com.apple.keychainaccess",
+    ],
     "audit_log": "audit.jsonl",
 }
 
@@ -42,7 +53,11 @@ def _load_config() -> dict:
     """Read config.json beside this file, creating it with defaults if absent."""
     path = ROOT / "config.json"
     if not path.exists():
-        path.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n", encoding="utf-8")
+        try:
+            path.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:  # read-only install dir must not stop the server
+            print(f"mac-commander: could not create config.json ({exc}); using defaults",
+                  file=sys.stderr)
         return dict(DEFAULT_CONFIG)
     try:
         return {**DEFAULT_CONFIG, **json.loads(path.read_text(encoding="utf-8"))}
@@ -76,6 +91,10 @@ def audit(tool: str, target: Any, summary: str, result: str) -> None:
 # AppleScript — script on stdin, values on argv, never interpolated
 # --------------------------------------------------------------------------
 
+OSASCRIPT = "/usr/bin/osascript"
+MAX_OSA_TIMEOUT = 300
+
+
 def osa(script: str, args: list[str], timeout: int = 30) -> dict:
     """Run `osascript - <args>` with `script` piped in verbatim.
 
@@ -84,14 +103,19 @@ def osa(script: str, args: list[str], timeout: int = 30) -> dict:
     program. `osascript -` is the same contract that actually works: program on
     stdin, all dynamic values as argv. Verified byte-exact for quotes, em
     dashes and emoji.
+
+    The binary is named by absolute path: PATH is inherited from whatever
+    launched the server, so resolving `osascript` by name would let an earlier
+    writable PATH entry substitute it. The timeout is bounded on both ends —
+    this server is single-threaded, so an unbounded osascript blocks every tool.
     """
-    argv = ["osascript", "-", *[str(a) for a in args]]
+    argv = [OSASCRIPT, "-", *[str(a) for a in args]]
     try:
         proc = subprocess.run(
             argv,
             input=script.encode("utf-8"),
             capture_output=True,
-            timeout=max(1, int(timeout)),
+            timeout=max(1, min(int(timeout), MAX_OSA_TIMEOUT)),
         )
     except subprocess.TimeoutExpired:
         return {"exit_code": -1, "stdout": "", "stderr": f"timed out after {timeout}s"}
@@ -175,11 +199,19 @@ def _label(el) -> str:
     return ""
 
 
+MAX_REFS = 20000
+
+
 def _new_ref(el, pid: int, app_key: str, center) -> str:
     global _ref_seq
     _ref_seq += 1
     ref = f"e{_ref_seq}"
     _REFS[ref] = {"el": el, "pid": pid, "app": app_key, "center": center}
+    # Invalidation only happens when an app returns under a new pid, so without
+    # this a long-lived server pins an AXUIElement per element, per see(), for
+    # the life of the process. Oldest first: dicts keep insertion order.
+    while len(_REFS) > MAX_REFS:
+        _REFS.pop(next(iter(_REFS)))
     return ref
 
 
@@ -192,12 +224,19 @@ def _invalidate(app_key: str, pid: int) -> None:
 
 
 def _collect(el, pid: int, app_key: str, out: list, budget: dict, depth: int = 0) -> None:
-    """Depth-first walk gathering interactive elements, bounded on every axis."""
-    if depth > MAX_DEPTH or len(out) >= budget["max"] or budget["nodes"] >= MAX_NODES:
+    """Depth-first walk gathering interactive elements, bounded on every axis.
+
+    budget["count"] spans the whole snapshot, not one app: max_elements used to
+    be applied per app, so see(all=True) could return max_elements times the
+    number of running apps.
+    """
+    if depth > MAX_DEPTH or budget["count"] >= budget["max"] or budget["nodes"] >= MAX_NODES:
+        budget["truncated"] = budget["truncated"] or budget["count"] >= budget["max"]
         return
     children = _attr(el, AS.kAXChildrenAttribute) or []
     for child in children:
-        if len(out) >= budget["max"] or budget["nodes"] >= MAX_NODES:
+        if budget["count"] >= budget["max"] or budget["nodes"] >= MAX_NODES:
+            budget["truncated"] = budget["truncated"] or budget["count"] >= budget["max"]
             return
         budget["nodes"] += 1
         role = _attr(child, AS.kAXRoleAttribute)
@@ -212,6 +251,7 @@ def _collect(el, pid: int, app_key: str, out: list, budget: dict, depth: int = 0
             if center:
                 item["xy"] = [round(center[0], 1), round(center[1], 1)]
             out.append(item)
+            budget["count"] += 1
         _collect(child, pid, app_key, out, budget, depth + 1)
 
 
@@ -370,7 +410,10 @@ def press_combo(combo: str) -> None:
         if part in MODIFIERS:
             flags |= MODIFIERS[part]
         elif part == "" and key is None:
-            key = "="  # "cmd++" is not a thing; treat a bare + as the = key
+            # A trailing plus ("cmd+") means the + key itself. "cmd++" splits to
+            # two empty parts and still raises below — write "cmd+shift+=" for
+            # that, which is what + is on a US layout.
+            key = "="
         elif key is None:
             key = part
         else:
@@ -437,6 +480,37 @@ def mouse_drag(x1: float, y1: float, x2: float, y2: float) -> None:
 # Step execution
 # --------------------------------------------------------------------------
 
+def _window_rects(pid: int) -> list[tuple[float, float, float, float]]:
+    """(x, y, w, h) for each of the pid's accessibility windows."""
+    app_el = AS.AXUIElementCreateApplication(pid)
+    AS.AXUIElementSetMessagingTimeout(app_el, 2.0)
+    rects = []
+    for win in _attr(app_el, AS.kAXWindowsAttribute) or []:
+        pos, size = _geometry(win)
+        if pos and size:
+            rects.append((pos[0], pos[1], size[0], size[1]))
+    return rects
+
+
+def _check_inside(x: float, y: float, pid: int, what: str) -> None:
+    """Refuse a point that is not over one of the target app's windows.
+
+    Mouse events post at the HID tap, so they land wherever the pointer is, not
+    in the process the focus guard verified. Unchecked, an explicit xy walked
+    straight past the blocklist: aim at a password manager's window while a
+    permitted app holds focus, and the after-check notices too late.
+    """
+    rects = _window_rects(pid)
+    if not rects:
+        return  # nothing to check against; the focus guard is the only cover
+    if any(rx <= x <= rx + rw and ry <= y <= ry + rh for rx, ry, rw, rh in rects):
+        return
+    raise ValueError(
+        f"{what} ({x:.0f},{y:.0f}) is outside every window of the target app — "
+        "refused: an event there would land in whatever app owns that point"
+    )
+
+
 def _resolve_point(step: dict, pid: int, ref_key: str, xy_key: str) -> tuple[float, float]:
     """Turn a ref or an explicit xy into live screen coordinates."""
     ref = step.get(ref_key)
@@ -446,13 +520,18 @@ def _resolve_point(step: dict, pid: int, ref_key: str, xy_key: str) -> tuple[flo
             raise ValueError(f"unknown ref {ref!r} — call see() first")
         if entry["pid"] != pid:
             raise ValueError(f"ref {ref!r} belongs to pid {entry['pid']}, not the target app")
-        live = _center(entry["el"]) or entry["center"]
+        # No fallback to entry["center"]: a ref whose element has gone means the
+        # UI moved, and the cached point may now sit over something else.
+        live = _center(entry["el"])
         if live is None:
-            raise ValueError(f"ref {ref!r} has no on-screen position (element gone?)")
+            raise ValueError(f"ref {ref!r} no longer has an on-screen position "
+                             "(the element is gone or moved) — call see() again")
         return live
     xy = step.get(xy_key)
     if isinstance(xy, (list, tuple)) and len(xy) == 2:
-        return (float(xy[0]), float(xy[1]))
+        x, y = float(xy[0]), float(xy[1])
+        _check_inside(x, y, pid, f"{xy_key}")
+        return (x, y)
     raise ValueError(f"step needs {ref_key!r} or {xy_key!r}")
 
 
@@ -513,6 +592,22 @@ def execute_step(step: dict, pid: int) -> str:
     raise ValueError(f"unknown step kind {kind!r}")
 
 
+def _script_fingerprint(script: str) -> str:
+    """Identify an AppleScript in the audit log without transcribing it.
+
+    Logging the first line recorded nothing, since every script opens with the
+    documented `on run argv`; logging the body would write whatever it embeds
+    into an append-only file. A hash, a size and the first real body line let
+    two calls be told apart and a known script be matched later.
+    """
+    text = script or ""
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    lines = [ln.strip() for ln in text.splitlines()]
+    body = next((ln for ln in lines
+                 if ln and not ln.startswith("on run") and not ln.startswith("--")), "")
+    return f"sha256:{digest} {len(text)}c/{len(lines)}L {body[:60]}"
+
+
 def _summarize(steps: list) -> str:
     """Audit summary. Typed text is counted, never recorded — it may be a secret."""
     parts = []
@@ -540,8 +635,15 @@ mcp = FastMCP(
         "buttons, type text, press keyboard shortcuts, manage app windows, "
         "post notifications and run AppleScript. Use it to automate any Mac "
         "application that has no API. The usual sequence is see() to find "
-        "elements, then act() to drive them. It does not read or write files "
-        "and does not run shell commands."
+        "elements, then act() to drive them.\n\n"
+        "Scope, stated accurately: see(), act(), app() and notify() do not read "
+        "or write files and do not run shell commands, and act() additionally "
+        "refuses blocklisted apps and verifies focus around every step. "
+        "applescript() is the exception and is not bounded by any of that — "
+        "AppleScript can run shell commands via `do shell script`, read and "
+        "write files, and drive apps the blocklist would otherwise refuse. "
+        "Treat applescript() as full user-level access to the machine and "
+        "prefer the other four tools whenever they can do the job."
     ),
 )
 
@@ -566,7 +668,8 @@ def see(app: str | None = None, all: bool = False, vision: bool = False,
         notes.append("Accessibility permission is not granted to this process; "
                      "the element tree will be empty. Grant it in System Settings "
                      "> Privacy & Security > Accessibility.")
-    budget = {"max": max(1, min(int(max_elements), 1000)), "nodes": 0}
+    budget = {"max": max(1, min(int(max_elements), 1000)), "nodes": 0,
+              "count": 0, "truncated": False}
     front = frontmost()
 
     targets, scope = [], ""
@@ -584,8 +687,9 @@ def see(app: str | None = None, all: bool = False, vision: bool = False,
 
     apps = [_snapshot(t, budget) for t in targets]
     total = sum(len(a["elements"]) for a in apps)
-    if total >= budget["max"]:
-        notes.append(f"element list truncated at max_elements={budget['max']}")
+    if budget["truncated"]:
+        notes.append(f"element list truncated at max_elements={budget['max']} "
+                     f"(shared across all apps in this snapshot)")
 
     payload = {
         "frontmost": front,
@@ -599,35 +703,74 @@ def see(app: str | None = None, all: bool = False, vision: bool = False,
         audit("see", scope, f"all={all} vision=False", f"ok: {total} elements")
         return payload
 
-    shot = _screenshot(targets[0] if len(targets) == 1 else None)
-    if shot is None:
-        notes.append("Screen Recording permission is missing, so no image was "
-                     "captured. Grant it in System Settings > Privacy & Security "
-                     "> Screen Recording. The element tree above is unaffected.")
-        audit("see", scope, f"all={all} vision=True", "ok (no screen recording)")
+    # A screenshot of a blocklisted app is a bitmap of a password manager. The
+    # element tree is left alone — the key is named input_blocklist and reading
+    # a locked vault is legitimate — but writing its pixels out is not.
+    single = targets[0] if len(targets) == 1 else None
+    if single is not None:
+        blocked = blocklist_hit(single.localizedName(), single.bundleIdentifier())
+        if blocked:
+            notes.append(f"no screenshot: {single.localizedName()} matches "
+                         f"input_blocklist entry {blocked!r}. The element tree is unaffected.")
+            audit("see", scope, f"all={all} vision=True", f"ok: {total} elements, image refused")
+            return payload
+
+    png, err = _screenshot(single)
+    if png is None:
+        notes.append(err or "no image was captured")
+        audit("see", scope, f"all={all} vision=True", f"ok: {total} elements, no image")
         return payload
     audit("see", scope, f"all={all} vision=True", f"ok: {total} elements + image")
-    return [json.dumps(payload, ensure_ascii=False), Image(path=shot)]
+    return [json.dumps(payload, ensure_ascii=False), Image(data=png, format="png")]
 
 
-def _screenshot(running) -> str | None:
-    """Capture one app's window if we can identify it, else the whole screen."""
+def _window_id(running) -> int | None:
+    """The target app's frontmost normal-layer on-screen window, if it has one."""
+    pid = int(running.processIdentifier())
+    for win in Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID) or []:
+        if win.get(Quartz.kCGWindowOwnerPID) == pid and win.get(Quartz.kCGWindowLayer) == 0:
+            return int(win.get(Quartz.kCGWindowNumber))
+    return None
+
+
+def _screenshot(running) -> tuple[bytes | None, str | None]:
+    """Capture a window, or the whole screen only when explicitly unscoped.
+
+    Returns (png_bytes, error). Bytes are read and the temp file removed before
+    returning, so no capture of the user's screen is left on disk. An app-scoped
+    request whose window cannot be found returns an error rather than falling
+    back to a full-screen grab — that fallback fires for any hidden or
+    windowless app and hands back every other visible window.
+    """
     if not Quartz.CGPreflightScreenCaptureAccess():
-        return None
-    path = os.path.join(tempfile.mkdtemp(prefix="mac-commander-"), "shot.png")
+        return None, ("Screen Recording permission is missing, so no image was captured. "
+                      "Grant it in System Settings > Privacy & Security > Screen "
+                      "Recording. The element tree above is unaffected.")
     argv = ["/usr/sbin/screencapture", "-x", "-o"]
     if running is not None:
-        pid = int(running.processIdentifier())
-        for win in Quartz.CGWindowListCopyWindowInfo(
-                Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID) or []:
-            if win.get(Quartz.kCGWindowOwnerPID) == pid and win.get(Quartz.kCGWindowLayer) == 0:
-                argv += ["-l", str(win.get(Quartz.kCGWindowNumber))]
-                break
+        win_id = _window_id(running)
+        if win_id is None:
+            name = str(running.localizedName() or "the target app")
+            return None, (f"{name} has no identifiable on-screen window, so no image was "
+                          "captured. A whole-screen capture was NOT substituted — it would "
+                          "have returned every other visible window. Unhide or open a window, "
+                          "or call see(all=True, vision=True) to ask for the desktop "
+                          "deliberately.")
+        argv += ["-l", str(win_id)]
+    tmpdir = tempfile.mkdtemp(prefix="mac-commander-")
+    path = os.path.join(tmpdir, "shot.png")
     try:
-        subprocess.run(argv + [path], capture_output=True, timeout=20)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return path if os.path.exists(path) and os.path.getsize(path) > 0 else None
+        proc = subprocess.run(argv + [path], capture_output=True, timeout=20)
+        if not (os.path.exists(path) and os.path.getsize(path) > 0):
+            detail = proc.stderr.decode("utf-8", "replace").strip()[:160]
+            return None, f"screencapture produced no image{': ' + detail if detail else ''}"
+        with open(path, "rb") as fh:
+            return fh.read(), None
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"screencapture failed: {type(exc).__name__}: {exc}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @mcp.tool()
@@ -640,9 +783,15 @@ def act(target: str, steps: list[dict], settle_ms: int = 150) -> dict:
     Call see() first to get refs for the things you want to hit.
 
     Every step verifies `target` is frontmost immediately before firing and
-    again immediately after, so input can never land in the wrong window. If
-    anything steals focus mid-batch the remaining steps are abandoned and the
-    result names the step and the thief.
+    again immediately after. Focus is proven at those two boundaries, not
+    continuously: one step can post many events (a long type is chunked, a drag
+    is 15 events over ~300ms), so a steal mid-step is detected by the after
+    check rather than prevented — the batch then stops and the result says the
+    step's effect may have landed elsewhere. Remaining steps are abandoned and
+    the result names the step and the thief.
+
+    Explicit `xy` points are refused unless they fall inside one of the target
+    app's windows, since a mouse event goes wherever the pointer is.
 
     Step kinds (each a dict with "kind"):
       click  {ref|xy, button:"left"|"right", clicks:1|2}
@@ -707,14 +856,25 @@ def act(target: str, steps: list[dict], settle_ms: int = 150) -> dict:
     return {"ok": True, "steps_completed": completed, "target": {"name": name, "pid": pid}}
 
 
+APP_FOLDERS = ("/Applications", "/Applications/Utilities", "/System/Applications",
+               "/System/Applications/Utilities", str(Path.home() / "Applications"))
+
+
 def _app_url(name: str):
-    """Locate an app bundle by bundle id or by name in the usual places."""
+    """Locate an app bundle by bundle id or by name in the usual places.
+
+    `name` is a bare application name, never a path. Separators are rejected
+    before a path is built: `Path("/Applications") / "/tmp/Evil.app"` discards
+    the left operand and yields /tmp/Evil.app, and "../" escapes the same way,
+    so unchecked this launches any bundle on disk, not just the five folders.
+    """
+    if "/" in name or ".." in name or name.startswith("~"):
+        return None
     if "." in name:
         url = _WS.URLForApplicationWithBundleIdentifier_(name)
         if url is not None:
             return url
-    for folder in ("/Applications", "/Applications/Utilities", "/System/Applications",
-                   "/System/Applications/Utilities", str(Path.home() / "Applications")):
+    for folder in APP_FOLDERS:
         candidate = Path(folder) / f"{name}.app"
         if candidate.exists():
             return NSURL.fileURLWithPath_(str(candidate))
@@ -757,8 +917,9 @@ def app(action: str, name: str, window: dict | None = None) -> dict:
     """
     action = str(action).strip().lower()
     if action not in ("launch", "quit", "switch", "hide"):
-        return {"ok": False, "error": f"unknown action {action!r}; "
-                                      "use launch, quit, switch or hide"}
+        error = f"unknown action {action!r}; use launch, quit, switch or hide"
+        audit("app", name, action, f"error: {error}")  # every call gets a line
+        return {"ok": False, "error": error}
 
     if action == "launch":
         url = _app_url(name)
@@ -769,15 +930,25 @@ def app(action: str, name: str, window: dict | None = None) -> dict:
         config.setActivates_(True)
         _WS.openApplicationAtURL_configuration_completionHandler_(url, config, None)
         deadline = time.monotonic() + 15.0
-        running = None
+        running, launched = None, False
         while time.monotonic() < deadline:
             running = find_running(name)
             if running is not None and running.isFinishedLaunching():
+                launched = True
                 break
             time.sleep(0.15)
         if running is None:
             audit("app", name, action, "error: did not start")
             return {"ok": False, "error": f"{name} did not start within 15s"}
+        if not launched:
+            # The process exists but never reported finished launching. Saying
+            # ok here would tell the caller it is safe to drive the app.
+            audit("app", name, action, "error: did not finish launching")
+            return {"ok": False,
+                    "error": f"{name} started but had not finished launching after 15s",
+                    "app": {"name": str(running.localizedName() or ""),
+                            "bundle_id": str(running.bundleIdentifier() or ""),
+                            "pid": int(running.processIdentifier())}}
     else:
         running = find_running(name)
         if running is None:
@@ -819,7 +990,10 @@ def app(action: str, name: str, window: dict | None = None) -> dict:
             result["error"] = "hide was requested but the app is still visible"
 
     if window and action != "quit":
-        result["window"] = _place_window(int(running.processIdentifier()), window)
+        try:
+            result["window"] = _place_window(int(running.processIdentifier()), window)
+        except Exception as exc:  # malformed move/size must not escape the tool
+            result["window"] = f"{type(exc).__name__}: {exc}"
 
     audit("app", name, action, "ok" if result["ok"] else f"error: {result.get('error')}")
     return result
@@ -846,17 +1020,28 @@ def applescript(script: str, args: list[str] | None = None, timeout: int = 30) -
     cover — Finder, Mail, Music, Reminders, Calendar, System Events, or any
     app with a scripting dictionary.
 
+    UNBOUNDED BY DESIGN. Unlike the other four tools this one applies no
+    blocklist, no focus guard and no scope limit. AppleScript reaches the shell
+    through `do shell script`, reads and writes files, and can drive apps that
+    act() would refuse — including a password manager. It is full user-level
+    access to the machine, so reach for see()/act()/app()/notify() first and use
+    this only for what they genuinely cannot do.
+
     The script is passed through untouched on stdin and `args` arrive as argv,
     so write it with an `on run argv` handler and read your values from there.
     Never concatenate data into the script text: an embedded quote or em dash
     is exactly the failure this server exists to remove.
 
+    The audit log records a sha256 of the script, its size and its first body
+    line — enough to identify a script later, without transcribing whatever it
+    contains.
+
     Returns stdout, stderr and the exit code.
     """
     args = [str(a) for a in (args or [])]
     result = osa(script, args, timeout=timeout)
-    first_line = script.strip().splitlines()[0][:80] if script.strip() else "(empty)"
-    audit("applescript", first_line, f"{len(args)} args",
+    audit("applescript", _script_fingerprint(script),
+          f"{len(args)} args, {sum(len(a) for a in args)} arg chars",
           "ok" if result["exit_code"] == 0 else f"exit {result['exit_code']}: {result['stderr'][:200]}")
     return result
 

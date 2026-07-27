@@ -1,10 +1,18 @@
 # Mac-Commander
 
-A minimal macOS GUI-automation MCP server. Five tools, ~830 lines, one file.
+A minimal macOS GUI-automation MCP server. Five tools, one file.
 
-It replaces the third-party **MacOS-MCP** server. It does **not** read or write
-files and does not run shell commands for the caller — Desktop Commander owns
-that layer. The scope discipline is the feature.
+It replaces the third-party **MacOS-MCP** server. Four of its five tools —
+`see`, `act`, `app`, `notify` — do **not** read or write files and do not run
+shell commands; Desktop Commander owns that layer. The scope discipline is the
+feature.
+
+`applescript` is the deliberate exception and is **not** bounded by any of
+that. AppleScript reaches the shell through `do shell script`, reads and writes
+files, and can drive apps the blocklist would otherwise refuse — including a
+password manager, with no focus guard. Treat it as full user-level access to
+the machine and prefer the other four whenever they can do the job. See
+[Refusing input to sensitive apps](#refusing-input-to-sensitive-apps).
 
 Built to spec: [`SPEC.md`](SPEC.md) v1.0.
 
@@ -48,8 +56,11 @@ with stable refs (`"e17"`) that `act()` accepts.
 
 Scoped to a single app on purpose: a whole-desktop dump leaks every window
 title and dock item into the transcript. `all=true` is the explicit opt-in.
-`vision=true` adds a screenshot — of the target app's window when it can be
-identified, not the whole screen.
+`vision=true` adds a screenshot of the target app's window. If that window
+cannot be identified — the app is hidden, minimised or windowless — you get no
+image and a note saying why. It never silently substitutes a full-screen
+capture; only `all=true` widens the scope. A screenshot of a blocklisted app is
+refused outright, though its element tree is still readable.
 
 Refs are cached for the session and dropped when their app is relaunched under
 a new pid.
@@ -129,11 +140,16 @@ on stdin, values on argv, nothing interpolated. That is what `osa()` runs.
 
 ## Refusing input to sensitive apps
 
-`config.json` is created beside `server.py` on first run:
+`config.json` sits beside `server.py` (created on first run if absent):
 
 ```json
 {
-  "input_blocklist": ["1Password", "Passwords", "System Settings"],
+  "input_blocklist": [
+    "1Password", "com.1password.",
+    "Passwords", "com.apple.Passwords",
+    "System Settings", "com.apple.systempreferences",
+    "Keychain Access", "com.apple.keychainaccess"
+  ],
   "audit_log": "audit.jsonl"
 }
 ```
@@ -142,6 +158,16 @@ on stdin, values on argv, nothing interpolated. That is what `osa()` runs.
 matched case-insensitively and before the app is even resolved — so a
 blocklisted app that is not running is still refused, not reported missing.
 It fails closed.
+
+Both display names and bundle ids are listed because display names are
+localized: on a French Mac System Settings is "Réglages Système", and its
+bundle id (`com.apple.systempreferences`) shares no substring with its English
+name, so the name alone would guard nothing there.
+
+**What the blocklist does not cover.** It gates input through `act()` and
+screenshots through `see(vision=true)`. It does not gate the element tree, and
+`applescript` bypasses it entirely — AppleScript can drive any app. The
+blocklist raises the cost of an accident; it is not a containment boundary.
 
 ## Audit log
 
@@ -154,14 +180,30 @@ rewrites the file.
  "summary": "click(e151), type(20 chars), key(cmd+a), key(cmd+c)", "result": "ok: 4 steps"}
 ```
 
-Typed text is counted, never recorded — it might be a password.
+Typed text is counted, never recorded — it might be a password. AppleScript is
+identified by a sha256 prefix, its size, and its first body line, so two calls
+can be told apart and a known script matched later without transcribing what it
+contains:
+
+```json
+{"ts": "...", "tool": "applescript",
+ "target": "sha256:1c16b4b068a21152 43c/3L return item 1 of argv",
+ "summary": "1 args, 33 arg chars", "result": "ok"}
+```
+
+`notify` is the one tool whose message body is written to the log (first 120
+characters), since a notification is shown on screen anyway.
 
 ## Tests
 
 ```bash
-.venv/bin/python verify.py                            # all seven, live
-.venv/bin/python -m pytest test_focus_abort.py -v      # test 6 alone, no real input
+.venv/bin/python verify.py                                        # all seven, live
+.venv/bin/python -m pytest test_focus_abort.py test_audit_fixes.py -v   # hermetic, no real input
 ```
+
+`test_audit_fixes.py` pins the security fixes from the 2026-07-27 audit — the
+blocklist holding on non-English locales, launch-path rejection, xy bounds,
+capture scoping and audit-log fidelity. See [`AUDIT.md`](AUDIT.md).
 
 `verify.py` drives the real machine. It saves the clipboard before the TextEdit
 test and restores it after, and it closes the front TextEdit document only
