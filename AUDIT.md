@@ -206,11 +206,39 @@ macOS would make it one.
   than the margin, the natural split is a `_input.py` for the CGEvent
   primitives — but "one file" is itself a stated feature, so this is a real
   trade-off and Marty's call.
-- **`verify.py` is not CI-runnable** — it needs a live Mac, Accessibility, and
-  it drives TextEdit and the clipboard. During this audit its test 4 failed
-  once on a macOS Automation consent dialog, which looks exactly like a code
-  regression until you check. The hermetic suite added here is what should gate
+- **`verify.py` is not CI-runnable, and it proved it twice.** It needs a live
+  Mac with Accessibility, and it drives TextEdit and the clipboard. Test 4
+  failed once on a macOS Automation consent dialog, then later stopped passing
+  entirely (see below) — both times looking exactly like a code regression
+  until checked against base. The hermetic suite added here is what should gate
   changes; `verify.py` is an acceptance ritual, not a regression net.
+
+### Open: verify.py test 4, end of session
+
+Test 4 passed 8/8 twice after the fixes, then began failing consistently later
+in the same session. **It fails identically on the unmodified base commit
+(5e0b433), reproduced twice**, so it is not a regression from this audit — that
+is the load-bearing fact and it is established. The rest is honest uncertainty:
+
+Synthetic typing stopped reaching TextEdit at all. `act()` reports success,
+TextEdit is frontmost, the target `AXTextArea` reports `AXFocused: True`,
+`AXIsProcessTrusted()`, `CGPreflightScreenCaptureAccess()` and
+`CGPreflightListenEventAccess()` all return True, and macOS secure-input mode
+is not held by any pid — yet the document stays empty. Longer `settle_ms` (400,
+800) does not help, and the same batch split across two `act()` calls *did*
+work earlier, which points at something in the session's CGEvent HID path
+rather than at step sequencing.
+
+Two hypotheses were tested and **refuted**, recorded so the next audit does not
+retread them: (a) leftover TextEdit documents making verify.py's geometric
+text-area pick ambiguous — the failure reproduces with exactly one document
+open; (b) `execute_step` returning early because `AXPress` succeeds on a text
+area without moving focus — `AXPress` actually fails there with -25206
+(`kAXErrorActionUnsupported`), so the real mouse-click fallback does run.
+
+Not diagnosed further, and deliberately not "fixed": changing input code to
+chase an environment fault would be the worst possible outcome of an audit.
+Re-run `verify.py` on a fresh login before treating this as a code defect.
 - **`scripts/` is now the thing to guard.** The audit moved the trust boundary
   onto a directory, which is a better place for it but not a free one: anything
   landing there runs unrestricted. Worth reviewing it the way you would review
