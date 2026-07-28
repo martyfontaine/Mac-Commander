@@ -56,9 +56,11 @@ no secrets in the working tree or in any of the 6 commits of history;
 | A-024 | server.py:41-56 | Info | `config.json` is read once at import and never re-read; editing the blocklist requires restarting the server. | Worth knowing when changing the blocklist — the change is not live. | DEFERRED | Behaviour confirmed by reading; no fix applied. |
 | A-025 | repo-wide | Info | No secrets in the working tree or in any of the 6 commits. No scanner is installed on this machine — gitleaks, trufflehog, pip-audit and osv-scanner are all absent — so this is a manual `git log -p` sweep plus targeted pattern searches, not a tool result. | Recording the method so the next audit knows what this baseline is worth. | n/a | `git log -p --all` filtered for key/token/password/PEM/AWS/Slack/GitHub patterns: no hits. |
 | A-026 | config.json | Info | `config.json` is committed, so `_load_config`'s auto-create branch is unreachable in a fresh clone — and a committed config **overrides** `DEFAULT_CONFIG` wholesale. | Found by testing the A-006 fix: editing `DEFAULT_CONFIG` alone changed nothing, because the shipped file replaced the list. Anyone hardening the defaults must edit both. | FIXED@9362b86 | Both updated; `blocklist_hit` re-verified against the loaded config. |
+| A-027 | server.py:430-434 | Medium | `press_combo` posted key-down **and** key-up both carrying the modifier flags and never released them, leaving the modifier asserted in the session's flag state. Found 2026-07-27 in follow-up work, after the audit run — it is the cause of the test 4 failure recorded below. | The next `CGEventKeyboardSetUnicodeString` is read as a shortcut and silently dropped: a `cmd+c` ending one `act()` batch eats the typing in the next. Keycode events are unaffected, so it presents as a dead HID path rather than a stuck flag. It also leaves a modifier asserted on the user's machine until a physical key press resets it. | FIXED@4bd37c3 | 5 hermetic tests in `test_audit_fixes.py` that **fail against the previous implementation**; `verify.py` run twice back-to-back, 11/11 then 11/11, with no residual flags after. |
 
-**Severity counts:** 1 Critical · 1 High · 10 Medium · 10 Low · 4 Info.
-**Status counts:** 23 FIXED · 1 PROPOSED (A-022) · 1 DEFERRED (A-024).
+**Severity counts:** 1 Critical · 1 High · 11 Medium · 10 Low · 4 Info.
+**Status counts:** 24 FIXED · 1 PROPOSED (A-022) · 1 DEFERRED (A-024).
+A-027 was found after the audit closed; the other 26 are the run itself.
 Both user decisions were resolved on the day — see Conflicts.
 
 ## Reconciliation
@@ -208,37 +210,52 @@ macOS would make it one.
   trade-off and Marty's call.
 - **`verify.py` is not CI-runnable, and it proved it twice.** It needs a live
   Mac with Accessibility, and it drives TextEdit and the clipboard. Test 4
-  failed once on a macOS Automation consent dialog, then later stopped passing
-  entirely (see below) — both times looking exactly like a code regression
-  until checked against base. The hermetic suite added here is what should gate
-  changes; `verify.py` is an acceptance ritual, not a regression net.
+  failed once on a macOS Automation consent dialog — environment — and later
+  stopped passing entirely, which turned out to be a genuine latent defect
+  (see below). Both looked identical from the outside, and checking against
+  base told the two apart only in the sense that neither was a regression *from
+  this audit*; it did not tell a fault in the machine from a fault in the code.
+  Only the hermetic suite did that. `verify.py` is an acceptance ritual, not a
+  regression net — but note it is what surfaced the defect in the first place,
+  by being run twice in a row with no human touching the keyboard.
 
-### Open: verify.py test 4, end of session
+### Closed: verify.py test 4, end of session — a real defect in `press_combo`
 
-Test 4 passed 8/8 twice after the fixes, then began failing consistently later
-in the same session. **It fails identically on the unmodified base commit
-(5e0b433), reproduced twice**, so it is not a regression from this audit — that
-is the load-bearing fact and it is established. The rest is honest uncertainty:
+Diagnosed and fixed in 4bd37c3 (**A-027**), later the same day, while adding
+acceptance test 8. Root cause: **`press_combo` left the modifier logically held.** It
+posted key-down and key-up both carrying `flags` and never cleared them, so the
+modifier stayed asserted in the session's flag state. The next
+`CGEventKeyboardSetUnicodeString` was then read as a shortcut and dropped.
+Keycode events were unaffected — `cmd+n` still opened a document while typing
+went nowhere, which is what made it look like a broken HID path rather than a
+stuck flag.
 
-Synthetic typing stopped reaching TextEdit at all. `act()` reports success,
-TextEdit is frontmost, the target `AXTextArea` reports `AXFocused: True`,
-`AXIsProcessTrusted()`, `CGPreflightScreenCaptureAccess()` and
-`CGPreflightListenEventAccess()` all return True, and macOS secure-input mode
-is not held by any pid — yet the document stays empty. Longer `settle_ms` (400,
-800) does not help, and the same batch split across two `act()` calls *did*
-work earlier, which points at something in the session's CGEvent HID path
-rather than at step sequencing.
+Why it was intermittent: physical key presses reset the flag state, so it only
+bit runs with no human at the keyboard in between. Test 4's own batch is click →
+type → cmd+a → cmd+c, so typing happens *before* the combos — the first run
+passes and arms the failure for the next one. Interactive re-runs kept passing;
+two back-to-back automated runs did not.
 
-Two hypotheses were tested and **refuted**, recorded so the next audit does not
-retread them: (a) leftover TextEdit documents making verify.py's geometric
-text-area pick ambiguous — the failure reproduces with exactly one document
-open; (b) `execute_step` returning early because `AXPress` succeeds on a text
-area without moving focus — `AXPress` actually fails there with -25206
-(`kAXErrorActionUnsupported`), so the real mouse-click fallback does run.
+Evidence, in both directions: `CGEventSourceFlagsState` read `0x20100000`
+(command asserted) immediately after a run and `0x20000000` once cleared;
+clearing it restored Unicode typing on the spot; a single `press_combo('cmd+a')`
+re-broke it. The fix posts one flags-cleared event after the key-up, guarded so
+a plain key still posts exactly key-down and key-up.
 
-Not diagnosed further, and deliberately not "fixed": changing input code to
-chase an environment fault would be the worst possible outcome of an audit.
-Re-run `verify.py` on a fresh login before treating this as a code defect.
+**The not-a-regression finding held exactly as recorded** — it fails identically
+on base because the defect was latent in base, not introduced by the audit. The
+lesson is that the two are not the same claim: "not a regression from this
+audit" was true and load-bearing, and it did not exonerate the code. Both
+earlier hypotheses stay **refuted**, and (a) was independently reconfirmed —
+the failure reproduces with exactly one document open.
+
+The warning that stood here — that changing input code to chase an environment
+fault would be the worst outcome of an audit — was the right instinct and is
+kept deliberately. What justified crossing it was hermetic evidence: the five
+tests pinning this in `test_audit_fixes.py` monkeypatch the event calls, fire no
+real input, need no live Mac, and **fail against the previous implementation**.
+An environment fault cannot fail a mocked unit test. Acceptance evidence alone
+would not have been enough to touch this code.
 - **`scripts/` is now the thing to guard.** The audit moved the trust boundary
   onto a directory, which is a better place for it but not a free one: anything
   landing there runs unrestricted. Worth reviewing it the way you would review
