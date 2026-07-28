@@ -137,6 +137,12 @@ Return stdout, stderr, exit code.
 6. Focus-abort path: unit test with mocked frontmost flipping mid-batch →
    asserts abort and correct failed_step.
 7. tail audit.jsonl → one line per call above.
+8. see(vision=true) on a windowed app → a real PNG of that window; on a
+   blocklisted app → the element tree with the image withheld and a note saying
+   so; and no capture left behind in the temp directory afterwards. Needs the
+   Screen Recording grant, which belongs to the host app running the script
+   (e.g. Terminal), not to python — without it this test reports UNVERIFIED
+   rather than passing silently.
 
 ## Deliverables & final report
 

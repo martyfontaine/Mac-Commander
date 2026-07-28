@@ -44,7 +44,11 @@ Launched by Claude Desktop, the server inherits Claude's grants. It needs:
   the element tree plus a note naming the missing permission.
 
 Running `verify.py` from a terminal instead uses *that terminal's* grants, which
-are usually narrower. `AXIsProcessTrusted()` is printed at the top of the run.
+are usually narrower — the grant attaches to the host app (Terminal, iTerm),
+not to the `python` binary. Both `AXIsProcessTrusted()` and
+`CGPreflightScreenCaptureAccess()` are printed at the top of the run. Test 8
+exercises the capture path and reports UNVERIFIED, not PASS, when Screen
+Recording is missing.
 
 ## The five tools
 
