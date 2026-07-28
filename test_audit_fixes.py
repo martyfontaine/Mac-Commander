@@ -47,6 +47,28 @@ def test_app_launch_rejects_paths(name):
     assert server._app_url(name) is None
 
 
+@pytest.mark.parametrize("name", [
+    "../../System/Applications/Calculator",   # traversal that really resolves
+    "/System/Applications/Calculator",        # absolute form of the same bundle
+])
+def test_app_launch_rejects_traversals_that_would_otherwise_resolve(name):
+    """The discriminating case.
+
+    The rejections above all name paths that do not exist, so they pass against
+    the unguarded implementation too and prove nothing on their own. These
+    resolve to a real bundle outside the five app folders: unguarded,
+    Path("/Applications") / "/System/.../Calculator.app" collapses to that
+    bundle and it launches. This is the case that fails without the guard.
+    """
+    # Self-validating: if the fixture bundle ever moves, fail loudly rather than
+    # silently degrading into another test that proves nothing.
+    assert Path("/System/Applications/Calculator.app").exists(), (
+        "fixture bundle missing — pick another app that exists outside "
+        "the five app folders, or this test stops discriminating"
+    )
+    assert server._app_url(name) is None
+
+
 def test_app_url_still_resolves_a_real_bundle_id():
     # com.apple.finder is present on every Mac; the guard must not break the
     # legitimate bundle-id branch.
@@ -269,7 +291,22 @@ def test_named_script_runs_and_is_labelled_by_name(monkeypatch):
 ])
 def test_named_script_rejects_paths(name):
     text, error = server._named_script(name)
-    assert text is None and error
+    assert text is None
+    # Assert the DISCRIMINATING half: without the guard these still return an
+    # error ("no script named ..."), because none of them happens to exist. Only
+    # the rejection message proves the guard ran.
+    assert "invalid script name" in error
+
+
+def test_named_script_rejects_a_traversal_that_would_otherwise_resolve():
+    """Unguarded, this reads a real file from outside scripts/."""
+    escape = "../scripts/echo-argv"
+    assert (server.SCRIPTS_DIR / "echo-argv.applescript").is_file(), "fixture missing"
+    # Prove the escape resolves on disk, so the guard is what stops it.
+    assert (server.SCRIPTS_DIR / f"{escape}.applescript").is_file()
+    text, error = server._named_script(escape)
+    assert text is None
+    assert "invalid script name" in error
 
 
 def test_unknown_script_name_lists_the_catalogue():
@@ -277,6 +314,89 @@ def test_unknown_script_name_lists_the_catalogue():
     assert result["ok"] is False
     assert "no script named" in result["error"]
     assert "echo-argv" in result["scripts"]
+
+
+# -- accuracy-review fixes, 2026-07-28 --
+
+def test_xy_is_refused_when_the_target_exposes_no_windows(monkeypatch):
+    """A-007 used to fail OPEN here, leaving the bounds check inert."""
+    monkeypatch.setattr(server, "_window_rects", lambda pid: [])
+    with pytest.raises(ValueError, match="exposes no accessibility windows"):
+        server._resolve_point({"xy": [99999, 99999]}, 4242, "ref", "xy")
+
+
+def test_unscoped_capture_refuses_when_a_blocklisted_app_is_on_screen(monkeypatch):
+    """A-005 only covered single-app scope; all=True took an unguarded grab."""
+    import AppKit
+
+    class FakeApp:
+        def __init__(self, name, bid): self._n, self._b = name, bid
+        def localizedName(self): return self._n
+        def bundleIdentifier(self): return self._b
+        def processIdentifier(self): return 4242
+        def activationPolicy(self): return AppKit.NSApplicationActivationPolicyRegular
+
+    targets = [FakeApp("TextEdit", "com.apple.TextEdit"),
+               FakeApp("1Password", "com.1password.1password7")]
+    monkeypatch.setattr(server, "_running_apps", lambda: targets)
+    monkeypatch.setattr(server, "_snapshot", lambda t, b: {
+        "name": t.localizedName(), "bundle_id": t.bundleIdentifier(),
+        "pid": 4242, "windows": [], "elements": []})
+    monkeypatch.setattr(server, "frontmost", lambda: {"name": "TextEdit", "pid": 4242})
+    monkeypatch.setattr(server, "_window_id", lambda t: 7)   # 1Password is on screen
+    monkeypatch.setattr(server, "audit", lambda *a: None)
+
+    def fail(*a, **k):
+        raise AssertionError("must not capture while a blocklisted app is on screen")
+
+    monkeypatch.setattr(server, "_screenshot", fail)
+    payload = server.see(all=True, vision=True)
+    assert isinstance(payload, dict)
+    assert any("1Password" in n and "no screenshot" in n for n in payload["notes"])
+
+
+def test_capture_error_does_not_steer_the_caller_to_the_unscoped_path(monkeypatch):
+    monkeypatch.setattr(server.Quartz, "CGPreflightScreenCaptureAccess", lambda: True)
+    monkeypatch.setattr(server, "_window_id", lambda running: None)
+
+    class FakeApp:
+        def processIdentifier(self): return 4242
+        def localizedName(self): return "Notes"
+
+    _, err = server._screenshot(FakeApp())
+    assert "all=True" not in err, "the error must not recommend the unscoped capture"
+
+
+def test_osa_timeout_message_reports_the_capped_value(monkeypatch):
+    def fake_run(argv, **kw):
+        raise server.subprocess.TimeoutExpired(cmd=argv, timeout=kw["timeout"])
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    result = server.osa("on run argv\nend run\n", [], timeout=10**9)
+    assert f"{server.MAX_OSA_TIMEOUT}s" in result["stderr"]
+    assert "1000000000" not in result["stderr"]
+
+
+def test_catalogue_call_is_audited(monkeypatch):
+    lines = []
+    monkeypatch.setattr(server, "audit", lambda *a: lines.append(a))
+    server.applescript()
+    assert lines, "applescript() with no arguments must still leave an audit line"
+
+
+def test_typed_events_pin_their_flags(monkeypatch):
+    """Typing must not inherit a modifier left asserted by anything else."""
+    seen = []
+    monkeypatch.setattr(server.Quartz, "CGEventCreateKeyboardEvent",
+                        lambda src, code, down: {"code": code, "down": down, "flags": None})
+    monkeypatch.setattr(server.Quartz, "CGEventSetFlags",
+                        lambda e, f: e.__setitem__("flags", f))
+    monkeypatch.setattr(server.Quartz, "CGEventKeyboardSetUnicodeString",
+                        lambda e, n, s: None)
+    monkeypatch.setattr(server.Quartz, "CGEventPost", lambda tap, e: seen.append(dict(e)))
+    server.type_text("hi")
+    assert seen, "no events posted"
+    assert all(e["flags"] == 0 for e in seen), f"typed events carry flags: {seen}"
 
 
 def test_bare_call_returns_the_catalogue():

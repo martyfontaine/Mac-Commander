@@ -114,15 +114,18 @@ def osa(script: str, args: list[str], timeout: int = 30) -> dict:
     this server is single-threaded, so an unbounded osascript blocks every tool.
     """
     argv = [OSASCRIPT, "-", *[str(a) for a in args]]
+    effective = max(1, min(int(timeout), MAX_OSA_TIMEOUT))
     try:
         proc = subprocess.run(
             argv,
             input=script.encode("utf-8"),
             capture_output=True,
-            timeout=max(1, min(int(timeout), MAX_OSA_TIMEOUT)),
+            timeout=effective,
         )
     except subprocess.TimeoutExpired:
-        return {"exit_code": -1, "stdout": "", "stderr": f"timed out after {timeout}s"}
+        # Report what was actually waited, not what was asked for — they differ
+        # whenever the caller's timeout was above the cap.
+        return {"exit_code": -1, "stdout": "", "stderr": f"timed out after {effective}s"}
     return {
         "exit_code": proc.returncode,
         "stdout": proc.stdout.decode("utf-8", "replace").rstrip("\n"),
@@ -402,6 +405,11 @@ def type_text(text: str) -> None:
         length = len(chunk.encode("utf-16-le")) // 2  # UniChar count, not code points
         for down in (True, False):
             event = Quartz.CGEventCreateKeyboardEvent(_SRC, 0, down)
+            # Pin the flags to none. Events inherit the session's flag state, so
+            # a modifier left asserted — by a combo, or by the user physically
+            # holding one — turns this text into a shortcut and it is dropped.
+            # press_combo releases its own flags; this covers every other source.
+            Quartz.CGEventSetFlags(event, 0)
             Quartz.CGEventKeyboardSetUnicodeString(event, length, chunk)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
         time.sleep(0.006)
@@ -517,7 +525,17 @@ def _check_inside(x: float, y: float, pid: int, what: str) -> None:
     """
     rects = _window_rects(pid)
     if not rects:
-        return  # nothing to check against; the focus guard is the only cover
+        # Fail closed. This used to return, leaving the check inert for any app
+        # exposing no AX windows — TextEdit with no document open, a menu-bar
+        # extra — which is exactly a target an injected caller could pick to get
+        # an unchecked click. With no windows there is no point that IS inside
+        # the target, so refusing is also the semantically correct answer; use a
+        # ref from see() to drive a windowless app.
+        raise ValueError(
+            f"{what} ({x:.0f},{y:.0f}) cannot be verified: the target app exposes no "
+            "accessibility windows to bound it against — refused. Use a ref from see() "
+            "instead of raw coordinates."
+        )
     if any(rx <= x <= rx + rw and ry <= y <= ry + rh for rx, ry, rw, rh in rects):
         return
     raise ValueError(
@@ -627,12 +645,12 @@ def _named_script(name: str) -> tuple[str | None, str | None]:
     if not name or "/" in name or "\\" in name or ".." in name or name.startswith("~"):
         return None, f"invalid script name {name!r}: use a bare name from the catalogue"
     path = SCRIPTS_DIR / f"{name}.applescript"
-    if not path.is_file():
-        return None, (f"no script named {name!r}. Available: "
-                      f"{', '.join(_script_catalogue()) or '(none)'}")
     try:
+        if not path.is_file():
+            return None, (f"no script named {name!r}. Available: "
+                          f"{', '.join(_script_catalogue()) or '(none)'}")
         return path.read_text(encoding="utf-8"), None
-    except OSError as exc:
+    except (OSError, ValueError) as exc:  # is_file() raises too, e.g. on a NUL byte
         return None, f"could not read script {name!r}: {exc}"
 
 
@@ -751,11 +769,19 @@ def see(app: str | None = None, all: bool = False, vision: bool = False,
     # A screenshot of a blocklisted app is a bitmap of a password manager. The
     # element tree is left alone — the key is named input_blocklist and reading
     # a locked vault is legitimate — but writing its pixels out is not.
+    #
+    # Checked against EVERY target, not just a single-app scope: an unscoped
+    # capture is a picture of the whole desktop, so a blocklisted app that is
+    # merely on screen ends up in it. Scoping the request does not narrow the
+    # pixels when there is no window filter to apply.
     single = targets[0] if len(targets) == 1 else None
-    if single is not None:
-        blocked = blocklist_hit(single.localizedName(), single.bundleIdentifier())
-        if blocked:
-            notes.append(f"no screenshot: {single.localizedName()} matches "
+    for target in targets:
+        blocked = blocklist_hit(target.localizedName(), target.bundleIdentifier())
+        # For an unscoped capture, only an app actually showing a window can
+        # land in the bitmap — refusing merely because it is running would mean
+        # no desktop capture ever succeeds while a password manager sits idle.
+        if blocked and (target is single or _window_id(target) is not None):
+            notes.append(f"no screenshot: {target.localizedName()} matches "
                          f"input_blocklist entry {blocked!r}. The element tree is unaffected.")
             audit("see", scope, f"all={all} vision=True", f"ok: {total} elements, image refused")
             return payload
@@ -799,9 +825,8 @@ def _screenshot(running) -> tuple[bytes | None, str | None]:
             name = str(running.localizedName() or "the target app")
             return None, (f"{name} has no identifiable on-screen window, so no image was "
                           "captured. A whole-screen capture was NOT substituted — it would "
-                          "have returned every other visible window. Unhide or open a window, "
-                          "or call see(all=True, vision=True) to ask for the desktop "
-                          "deliberately.")
+                          "have returned every other visible window. Unhide the app or open "
+                          "a window, then ask again.")
         argv += ["-l", str(win_id)]
     tmpdir = tempfile.mkdtemp(prefix="mac-commander-")
     path = os.path.join(tmpdir, "shot.png")
@@ -1089,7 +1114,10 @@ def applescript(name: str | None = None, script: str | None = None,
     args = [str(a) for a in (args or [])]
 
     if not name and not script:
-        return {"ok": True, "scripts": _script_catalogue(),
+        catalogue = _script_catalogue()
+        audit("applescript", "(catalogue)", "0 args",
+              f"ok: listed {len(catalogue)} scripts")  # every call leaves a line
+        return {"ok": True, "scripts": catalogue,
                 "raw_allowed": bool(CONFIG.get("allow_raw_applescript")),
                 "hint": "call applescript(name=..., args=[...]); add new scripts "
                         f"to {SCRIPTS_DIR}"}

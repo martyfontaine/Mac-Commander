@@ -34,32 +34,34 @@ no secrets in the working tree or in any of the 6 commits of history;
 | A-002 | server.py:613-630 | High | `see(app=X, vision=True)` silently captured the entire screen whenever no layer-0 window could be found for X; nothing in the payload said the scope had widened. | Routine trigger (app hidden, minimised or windowless), and README promised "of the target app's window …, not the whole screen". Hands back every other visible window — the exact whole-desktop leak scoping exists to prevent. | FIXED@9362b86 | `test_scoped_capture_refuses_rather_than_grabbing_the_whole_screen` fails the test if `screencapture` is invoked unscoped for a named app. |
 | A-003 | server.py:617 | Medium | Every `see(vision=True)` wrote a PNG of the screen into a fresh `mkdtemp` directory that nothing ever deleted. | Screen contents at rest, accumulating for the life of the machine. `Image(path=)` reads lazily after return, so the file could not simply be unlinked — bytes are now read up front and passed as `Image(data=)`. | FIXED@9362b86 | `test_capture_removes_its_temp_directory` asserts the directory is gone before return. |
 | A-004 | server.py:858 | Medium | Every `applescript` audit line recorded the literal string `on run argv` — the documented mandatory first line — plus an argument count. Nothing about what ran. | The append-only log is the *only* detective control over the one tool that can do arbitrary damage. 50 existing log lines confirmed: every applescript row identical. A clipboard read and an exfiltration script were indistinguishable. | FIXED@9362b86 | `test_script_fingerprint_distinguishes_scripts`; visible live in `verify.py` output as `sha256:1c16b4b068a21152 43c/3L return item 1 of argv`. |
-| A-005 | server.py:549-610 | Medium | `see()` consulted no blocklist, so `see(app="1Password", vision=true)` would return the password manager's element tree **and** write a bitmap of its window. `_label()` falls back to `AXValue`, so a revealed field's contents enter the transcript. | The threat model's named stake is credentials being read out of a password manager. Reading is the higher-value attack; the control only covered typing. | FIXED@9362b86 (screenshot) / USER-DECISION (element tree) | Screenshot refusal implemented and asserted; tree access deliberately unchanged — see Conflicts. |
+| A-005 | server.py:549-610 | Medium | `see()` consulted no blocklist, so `see(app="1Password", vision=true)` would return the password manager's element tree **and** write a bitmap of its window. `_label()` falls back to `AXValue`, so a revealed field's contents enter the transcript. | The threat model's named stake is credentials being read out of a password manager. Reading is the higher-value attack; the control only covered typing. | FIXED@9362b86 · completed@2026-07-28 (screenshot) / resolved (element tree, left readable) | The 2026-07-28 review found the refusal only covered a **single-app** scope: `see(all=True, vision=True)` set `single = None`, skipped the check and took a full-screen grab, so a visible password manager still reached the transcript — and `_screenshot`'s own error text recommended that exact call. Now every target is checked (an unscoped grab is refused when a blocklisted app has a window on screen) and the steering text is gone. Pinned by `test_unscoped_capture_refuses_when_a_blocklisted_app_is_on_screen` and `test_capture_error_does_not_steer_the_caller_to_the_unscoped_path`, both of which fail against the 9362b86 code. |
 | A-006 | server.py:36, config.json | Medium | The blocklist matched substrings of the **localized display name**. "System Settings" therefore guarded nothing outside English: its bundle id is `com.apple.systempreferences`, which shares no substring with its English name. | One of the three shipped entries silently protected nothing on a French, German or Japanese Mac — no refusal, no warning, an `ok` audit line. | FIXED@9362b86 | Bundle id confirmed via `defaults read`. Parametrised test covers English/French/German/Japanese names; `test_benign_apps_are_not_blocked` guards against over-blocking. |
-| A-007 | server.py:453-456 | Medium | A raw `xy` in an `act()` step was never bounds-checked against the target's windows. | Mouse events post at `kCGHIDEventTap` and land wherever the pointer is, not in the process the guard verified. A click aimed at a blocklisted app's window landed there while a permitted app held focus — a blocklist bypass through `act()` itself, detected only by the after-check, once the click had fired. | FIXED@9362b86 | `test_xy_outside_the_target_windows_is_refused` / `test_xy_inside_the_target_window_is_allowed`. |
+| A-007 | server.py:453-456 | Medium | A raw `xy` in an `act()` step was never bounds-checked against the target's windows. | Mouse events post at `kCGHIDEventTap` and land wherever the pointer is, not in the process the guard verified. A click aimed at a blocklisted app's window landed there while a permitted app held focus — a blocklist bypass through `act()` itself, detected only by the after-check, once the click had fired. | FIXED@9362b86 · completed@2026-07-28 | `test_xy_outside_the_target_windows_is_refused` / `test_xy_inside_the_target_window_is_allowed`. The 2026-07-28 review found the check **failed open**: `if not rects: return` left it inert for any app exposing no AX windows (TextEdit with no document, a menu-bar extra) — precisely the target an injected caller would pick. Now fails closed, pinned by `test_xy_is_refused_when_the_target_exposes_no_windows`. |
 | A-008 | server.py:449 | Medium | When a ref's element no longer existed, `_resolve_point` silently substituted the coordinates cached at snapshot time. | The UI having moved is exactly when the stale point is most likely to be over something else — a click delivered to whatever now occupies those pixels. | FIXED@9362b86 | `test_dead_ref_does_not_fall_back_to_cached_coordinates`. |
 | A-009 | server.py:641 (docstring) | Medium | The `act()` docstring promised "input can never land in the wrong window". Focus is proven at the two step boundaries only; a chunked type or a 15-event drag fires over hundreds of ms between those checks. | The model calibrates its trust from this text. The mechanism detects a mid-step steal after the fact — the README was honest ("may have landed elsewhere"), the model-facing docstring was not. | FIXED@9362b86 | Docstring now states the real guarantee. Measured: 2000 chars ≈ 125 chunks ≈ 750ms; drag ≈ 285ms. |
 | A-010 | server.py:585-588 | Medium | `max_elements` was enforced per app rather than across the snapshot, and the truncation note fired whenever the *sum* crossed the cap even if nothing was truncated. | `see(all=True)` could return `max_elements` × number-of-apps — the context bloat the cap exists to prevent — while the note misreported both ways. | FIXED@9362b86 | Budget now shared via `budget["count"]`; note driven by an explicit `truncated` flag. |
-| A-011 | server.py:710-722 | Medium | `_app_url()` built `Path(folder) / f"{name}.app"` from the caller-supplied name. `Path("/Applications") / "/tmp/Evil.app"` discards the left operand; `../` escapes the same way. | Launches any bundle on disk rather than the five app folders. Marty runs Desktop Commander alongside this server, which *can* write files — so "write a bundle to /tmp, then launch it by path" is a live cross-tool chain, not a hypothetical. Raised from the finder's Low for that reason. | FIXED@9362b86 | Demonstrated: `/tmp/Evil` → `/private/tmp/Evil.app`, `../../../../tmp/Evil` → `/private/tmp/Evil.app`. Five rejection cases tested; `test_app_url_still_resolves_a_real_bundle_id` guards the legitimate path. |
+| A-011 | server.py:710-722 | Medium | `_app_url()` built `Path(folder) / f"{name}.app"` from the caller-supplied name. `Path("/Applications") / "/tmp/Evil.app"` discards the left operand; `../` escapes the same way. | Launches any bundle on disk rather than the five app folders. Marty runs Desktop Commander alongside this server, which *can* write files — so "write a bundle to /tmp, then launch it by path" is a live cross-tool chain, not a hypothetical. Raised from the finder's Low for that reason. | FIXED@9362b86 | Demonstrated: `/tmp/Evil` → `/private/tmp/Evil.app`, `../../../../tmp/Evil` → `/private/tmp/Evil.app`. The 2026-07-28 review found the five rejection cases **vacuous**: none of those paths exists, so the base implementation returns None for all five and the test passed against unguarded code. The fix itself is real — base resolves `../../System/Applications/Calculator` to a launchable bundle, the guard rejects it — and that discriminating case is now `test_app_launch_rejects_traversals_that_would_otherwise_resolve`, which fails without the guard. `test_app_url_still_resolves_a_real_bundle_id` guards the legitimate path. |
 | A-012 | verify.py | Medium | `app()`, the capture path, the blocklist's bundle-id behaviour and launch-path handling had **no automated coverage**. `verify.py` needs a live Mac with Accessibility, so `test_focus_abort.py` (5 tests, focus only) was the entire CI-runnable suite. | A security control with no hermetic test regresses silently. | FIXED@9362b86 | `test_audit_fixes.py` added: 28 tests, each pinned to a finding. Suite now 33 hermetic tests. |
 | A-013 | server.py:771-790 | Low | `app(action="launch")` returned `ok=True` when its 15s wait expired without the app finishing launching, as long as some app matched the name. | Tells the caller it is safe to drive an app that is not ready. | FIXED@9362b86 | Returns an explicit not-finished-launching error. |
 | A-014 | server.py:733-740 | Low | `_place_window` coerced unvalidated caller data with `float()` and indexing, so a malformed `window` dict raised out of the tool — losing the audit line and returning an unstructured error. | Every other failure in this server is structured; this one escaped to FastMCP. | FIXED@9362b86 | Wrapped; the error is reported in `result["window"]`. |
 | A-015 | server.py:758-761 | Low | `app()` returned on an unrecognised action without writing an audit line. | README states every `see`/`act`/`app`/`notify`/`applescript` call appends one line. It did not. | FIXED@9362b86 | `test_unknown_app_action_is_audited`. |
-| A-016 | server.py:79-102 | Low | The caller-supplied `timeout` had a floor but no ceiling. | The server is single-threaded; `applescript(timeout=10**9)` wedges all five tools indefinitely. | FIXED@9362b86 | Capped at 300s; `test_osa_timeout_is_bounded`. |
+| A-016 | server.py:79-102 | Low | The caller-supplied `timeout` had a floor but no ceiling. | The server is single-threaded; `applescript(timeout=10**9)` wedges all five tools indefinitely. | FIXED@9362b86 · amended@2026-07-28 | Capped at 300s; `test_osa_timeout_is_bounded`. The 2026-07-28 review found the timeout *message* still reported the caller's uncapped value; now reports what was actually waited (`test_osa_timeout_message_reports_the_capped_value`). |
 | A-017 | server.py:133-135 | Low | `_REFS` was pruned only when an app reappeared under a different pid, so repeated `see()` on a live app grew it for the life of the process, each entry pinning an `AXUIElement`. | A long-lived server session accumulates unboundedly. Read-verified from the code, not live-demonstrated. | FIXED@9362b86 | Bounded at 20 000 with oldest-first eviction; `test_ref_cache_is_bounded`. |
 | A-018 | server.py:88 | Low | `osa()` executed the bare name `osascript`, resolved through the PATH inherited from whatever launched the server. | An earlier writable PATH entry substitutes the interpreter that runs every AppleScript. Requires PATH control, so Low. | FIXED@9362b86 | Absolute `/usr/bin/osascript`; `test_osa_uses_an_absolute_binary_path`. |
 | A-019 | server.py:603-606 | Low | Any capture failure was reported to the caller as a missing Screen Recording permission. | Sends the user to fix a permission that is already granted, hiding the real cause. | FIXED@9362b86 | `_screenshot` returns the actual error; `test_capture_reports_missing_permission_distinctly`. |
 | A-020 | server.py:41-51 | Low | `_load_config` wrote `config.json` at import with no exception handling. | A read-only install directory would stop the server from starting at all. | FIXED@9362b86 | Wrapped; falls back to defaults with a stderr note. |
-| A-021 | server.py:373 | Low | `press_combo`'s comment claimed it treated `"cmd++"` as the `=` key; that input actually raises "more than one non-modifier key". Only a trailing `"cmd+"` reaches the branch. | Comment describes behaviour the code does not have. Cosmetic — `cmd+shift+=` works — but the comment misleads the next reader. | FIXED@9362b86 | Comment corrected to match; behaviour unchanged. |
-| A-022 | requirements.txt | Low | All 49 pins are version-only: no lockfile, no hashes, no `--require-hashes`. | The process holds Accessibility and Screen Recording; a compromised package inherits both. | PROPOSED | Not fixed — adding hashes changes the documented install flow. |
+| A-021 | server.py:373 | ~~Low~~ **WITHDRAWN** | ~~`press_combo`'s comment claimed it treated `"cmd++"` as the `=` key.~~ **This finding was wrong — the auditor misread the comment.** The base comment reads `key = "="  # "cmd++" is not a thing; treat a bare + as the = key`, which states the opposite of what the row claimed and is accurate: a *trailing* `+` maps to `=`, and `cmd++` is explicitly called out as not a thing. | Nothing was wrong with the original comment. Recorded rather than deleted, because a withdrawn finding is part of the audit's record. | WITHDRAWN@2026-07-28 | Base comment re-read at `git show 5e0b433:server.py:373`. The 9362b86 reword is harmless and stands; the behaviour never changed. |
+| A-022 | requirements.txt | Low | All 39 pins are version-only: no lockfile, no hashes, no `--require-hashes`. | The process holds Accessibility and Screen Recording; a compromised package inherits both. | PROPOSED | Not fixed — adding hashes changes the documented install flow. |
 | A-023 | server.py:839 | Info | `notify()` writes the first 120 characters of the message body verbatim to the audit log. | Not a defect (a notification is displayed on screen anyway), but it is the one tool whose content reaches the log. Now documented in README. | FIXED@9362b86 (documented) | README "Audit log" section. |
 | A-024 | server.py:41-56 | Info | `config.json` is read once at import and never re-read; editing the blocklist requires restarting the server. | Worth knowing when changing the blocklist — the change is not live. | DEFERRED | Behaviour confirmed by reading; no fix applied. |
 | A-025 | repo-wide | Info | No secrets in the working tree or in any of the 6 commits. No scanner is installed on this machine — gitleaks, trufflehog, pip-audit and osv-scanner are all absent — so this is a manual `git log -p` sweep plus targeted pattern searches, not a tool result. | Recording the method so the next audit knows what this baseline is worth. | n/a | `git log -p --all` filtered for key/token/password/PEM/AWS/Slack/GitHub patterns: no hits. |
 | A-026 | config.json | Info | `config.json` is committed, so `_load_config`'s auto-create branch is unreachable in a fresh clone — and a committed config **overrides** `DEFAULT_CONFIG` wholesale. | Found by testing the A-006 fix: editing `DEFAULT_CONFIG` alone changed nothing, because the shipped file replaced the list. Anyone hardening the defaults must edit both. | FIXED@9362b86 | Both updated; `blocklist_hit` re-verified against the loaded config. |
-| A-027 | server.py:430-434 | Medium | `press_combo` posted key-down **and** key-up both carrying the modifier flags and never released them, leaving the modifier asserted in the session's flag state. Found 2026-07-27 in follow-up work, after the audit run — it is the cause of the test 4 failure recorded below. | The next `CGEventKeyboardSetUnicodeString` is read as a shortcut and silently dropped: a `cmd+c` ending one `act()` batch eats the typing in the next. Keycode events are unaffected, so it presents as a dead HID path rather than a stuck flag. It also leaves a modifier asserted on the user's machine until a physical key press resets it. | FIXED@4bd37c3 | 5 hermetic tests in `test_audit_fixes.py` that **fail against the previous implementation**; `verify.py` run twice back-to-back, 11/11 then 11/11, with no residual flags after. |
+| A-027 | server.py:430-434 | Medium | `press_combo` posted key-down **and** key-up both carrying the modifier flags and never released them, leaving the modifier asserted in the session's flag state. Found 2026-07-27 in follow-up work, after the audit run — it is the cause of the test 4 failure recorded below. | The next `CGEventKeyboardSetUnicodeString` is read as a shortcut and silently dropped: a `cmd+c` ending one `act()` batch eats the typing in the next. Keycode events are unaffected, so it presents as a dead HID path rather than a stuck flag. It also leaves a modifier asserted on the user's machine until a physical key press resets it. | FIXED@4bd37c3 · amended@2026-07-28 | 4 hermetic tests in `test_audit_fixes.py` that **fail against the previous implementation**, plus a 5th pinning the unchanged plain-key path (it passes on base by design — the release never fires without modifiers, so it is a guard against over-firing, not fix evidence); `verify.py` run twice back-to-back, 11/11 then 11/11, with no residual flags after. |
 
-**Severity counts:** 1 Critical · 1 High · 11 Medium · 10 Low · 4 Info.
-**Status counts:** 24 FIXED · 1 PROPOSED (A-022) · 1 DEFERRED (A-024).
+**Severity counts:** 1 Critical · 1 High · 11 Medium · 10 Low · 4 Info — 27 rows.
+**Status counts:** 23 FIXED · 1 WITHDRAWN (A-021) · 1 PROPOSED (A-022) ·
+1 DEFERRED (A-024) · 1 with no status, being an observation not a finding
+(A-025) = 27. Hermetic suite: 60 tests.
 A-027 was found after the audit closed; the other 26 are the run itself.
 Both user decisions were resolved on the day — see Conflicts.
 
@@ -202,8 +204,9 @@ macOS would make it one.
   controls rather than a tool argument the model controls. The blocklist and
   focus guard still prevent *accidents* rather than a determined adversary —
   the docs say so plainly now.
-- **`server.py` is 1050 lines against SPEC's 600–900 budget.** The audit fixes
-  added ~190 lines net. I did not delete security code to satisfy a line count,
+- **`server.py` is 1150 lines against SPEC's 600–900 budget** (865 at base; 1050
+  after the first fix pass, then the containment redesign, the `press_combo` fix
+  and the 2026-07-28 review fixes). I did not delete security code to satisfy a line count,
   and I flag rather than silently bust the spec. If the budget matters more
   than the margin, the natural split is a `_input.py` for the CGEvent
   primitives — but "one file" is itself a stated feature, so this is a real
@@ -245,15 +248,20 @@ a plain key still posts exactly key-down and key-up.
 **The not-a-regression finding held exactly as recorded** — it fails identically
 on base because the defect was latent in base, not introduced by the audit. The
 lesson is that the two are not the same claim: "not a regression from this
-audit" was true and load-bearing, and it did not exonerate the code. Both
-earlier hypotheses stay **refuted**, and (a) was independently reconfirmed —
-the failure reproduces with exactly one document open.
+audit" was true and load-bearing, and it did not exonerate the code. Both earlier hypotheses stay **refuted**, and are restated here so the
+anti-retread record survives: (a) leftover TextEdit documents making verify.py's
+geometric text-area pick ambiguous — refuted, and independently reconfirmed,
+because the failure reproduces with exactly one document open; (b)
+`execute_step` returning early because `AXPress` succeeds on a text area without
+moving focus — refuted, because `AXPress` there actually fails with -25206
+(`kAXErrorActionUnsupported`), so the real mouse-click fallback does run.
 
 The warning that stood here — that changing input code to chase an environment
 fault would be the worst outcome of an audit — was the right instinct and is
-kept deliberately. What justified crossing it was hermetic evidence: the five
-tests pinning this in `test_audit_fixes.py` monkeypatch the event calls, fire no
-real input, need no live Mac, and **fail against the previous implementation**.
+kept deliberately. What justified crossing it was hermetic evidence: the four
+discriminating tests pinning this in `test_audit_fixes.py` monkeypatch the event
+calls, fire no real input, need no live Mac, and **fail against the previous
+implementation** (a fifth pins the plain-key path and passes on base by design).
 An environment fault cannot fail a mocked unit test. Acceptance evidence alone
 would not have been enough to touch this code.
 - **`scripts/` is now the thing to guard.** The audit moved the trust boundary
@@ -267,3 +275,98 @@ would not have been enough to touch this code.
 - **No scanner tooling is installed.** `pip-audit` in the venv and `gitleaks`
   via Homebrew would make the dependency and secrets halves of the next audit
   evidence-based rather than manual.
+
+---
+
+# Accuracy review — 2026-07-28
+Reviewing: the 2026-07-27 audit above · Branch: audit/2026-07-27 · Method: five
+parallel reviewers over the code, each claim re-checked against `git show
+5e0b433:<file>`, then verified by hand.
+
+An audit is only worth its trustworthiness, so this pass audited the audit: is
+every claim above true, does every fix do what its row says, did the audit break
+anything, and do the tests it cites actually verify anything? Rows corrected in
+place — a log that knowingly states something false is worse than no log — with
+each amendment marked and dated so the original claim stays visible.
+
+## What was wrong
+
+**One finding was simply wrong and is withdrawn.** A-021 claimed `press_combo`'s
+comment described behaviour the code did not have. It did not: the base comment
+reads `"cmd++" is not a thing; treat a bare + as the = key`, which is accurate
+and says the opposite of what the row asserted. The auditor misread it. Marked
+WITHDRAWN rather than deleted.
+
+**Two security fixes were incomplete**, both found by reading the code rather
+than the audit:
+
+- *A-007 failed open.* `_check_inside` returned without checking whenever the
+  target exposed no accessibility windows — TextEdit with no document open, a
+  menu-bar extra — which is exactly the target an injected caller would choose
+  to get an unchecked click. The row said "Points outside the target's windows
+  are now refused" with no caveat. Now fails closed.
+- *A-005 covered only single-app scope.* `see(all=True, vision=True)` set
+  `single = None`, skipped the blocklist entirely and took a full-screen grab,
+  so a visible password manager still reached the transcript. Worse,
+  `_screenshot`'s own error text recommended that exact call as the workaround
+  when a window could not be found — the code was steering the model into the
+  hole. Every target is now checked, and the steering text is gone.
+
+**Two cited tests verified nothing.** `test_app_launch_rejects_paths` and
+`test_named_script_rejects_paths` pass identically against the unguarded base
+code, because every path they name is one that does not exist — the base
+implementation returns None for all of them for the wrong reason. The
+underlying fixes are real (base resolves `../../System/Applications/Calculator`
+to a launchable bundle; the guard rejects it), but the evidence cited for them
+was not. Both now carry a case that resolves, and the named-script test asserts
+the rejection *message* rather than merely that an error occurred.
+
+**Smaller inaccuracies:** A-016's timeout message reported the caller's uncapped
+value rather than what was waited; A-022 said 49 pins where `requirements.txt`
+has 39; A-027 claimed 5 discriminating tests where 4 discriminate and the fifth
+pins an unchanged path; the status counts covered 26 of 27 rows; the line and
+suite counts had gone stale. `applescript()` called with no arguments returned
+the catalogue without writing an audit line, quietly breaking the very
+every-call-is-logged invariant A-015 was about.
+
+**One integrity regression, now repaired.** Commit d1e9226 deleted the text
+describing the two refuted hypotheses for the test-4 failure while keeping the
+sentence that referred to them, leaving a dangling "(a)" with no antecedent and
+losing the -25206 evidence. The whole point of recording a refuted hypothesis is
+so the next audit does not retread it. Restored.
+
+## What held up
+
+The load-bearing claims survived. 77 individual claims were re-checked and
+confirmed, including: no path reaches `osa()` with model-authored script text
+while `allow_raw_applescript` is false (probed exhaustively, including
+`name`+`script` together, empty and None names); the blocklist genuinely holds
+on non-English locales; `_screenshot` never substitutes a full-screen grab for
+an app-scoped request and always removes its temp directory; the element budget
+is genuinely shared across apps; every `app()` exit path audits; A-027's
+mechanism and its pre-existence in base.
+
+A-027's headline claim was re-verified independently: `press_combo` posts
+key-down and key-up both carrying the modifier flags, the release event does
+clear them, and the `if flags:` guard means a plain key still posts exactly two
+events. The flag arithmetic quoted in that section is internally consistent —
+`0x20100000` and `0x20000000` differ by exactly `0x100000`, the command bit.
+
+`type_text` now pins its own flags to zero as well. The `press_combo` release
+addresses contamination that `press_combo` itself causes; it does nothing about
+a modifier the user is physically holding when `act()` fires, which produces the
+same swallowed-text symptom.
+
+## Bigger picture
+
+- **The tests were the weak link, not the fixes.** Every fix examined was real;
+  two of the tests certifying them were not. A test written from the same
+  understanding that produced the fix inherits its blind spots — the cheap
+  discipline that catches this is to revert the fix and confirm the test fails,
+  which is now done for every security-relevant test added in this pass.
+- **`_check_inside` and the A-005 branch were both "fixed" in the narrow case
+  the test exercised** and open in the general one. Both holes were in the
+  *shape* of the guard (single target, non-empty rects), not its logic.
+- **The deployed server still advertises the pre-fix instructions.** Claude
+  Desktop holds the old `instructions` string until it is restarted, so the
+  model is still being told this server cannot run shell commands.
