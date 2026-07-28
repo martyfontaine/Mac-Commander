@@ -21,17 +21,6 @@ Built to spec: [`SPEC.md`](SPEC.md) v1.0.
 Add this to `~/Library/Application Support/Claude/claude_desktop_config.json`
 inside the existing `"mcpServers"` object, then quit and reopen Claude Desktop:
 
-```json
-{
-  "mcpServers": {
-    "mac-commander": {
-      "command": "/Users/Marty/Claude/Mac-Commander/.venv/bin/python",
-      "args": ["/Users/Marty/Claude/Mac-Commander/server.py"]
-    }
-  }
-}
-```
-
 Remove the old `MacOS-MCP` entry at the same time — running both means two
 things fighting over the same keyboard.
 
