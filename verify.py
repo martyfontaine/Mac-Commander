@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Acceptance tests 1-7 from SPEC.md, run live against this Mac.
+"""Acceptance tests 1-8 from SPEC.md, run live against this Mac.
 
 Run: .venv/bin/python verify.py
 
-Tests 1-5 and 7 drive the real machine: they post a notification, run
-AppleScript, snapshot Finder, type into a scratch TextEdit document, and try to
-touch a blocklisted app. Test 6 is a pure unit test and is delegated to pytest.
+Tests 1-5, 7 and 8 drive the real machine: they post a notification, run
+AppleScript, snapshot Finder, type into a scratch TextEdit document, try to
+touch a blocklisted app, and capture a window. Test 6 is a pure unit test and is
+delegated to pytest.
 
 Two safety rules this script keeps: the clipboard is saved before test 4 and
 restored after, and TextEdit documents it did not create are never closed.
@@ -14,6 +15,7 @@ restored after, and TextEdit documents it did not create are never closed.
 import json
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -69,16 +71,29 @@ def test_1_notify() -> None:
 
 # -- 2 -----------------------------------------------------------------------
 def test_2_applescript_roundtrip() -> None:
-    banner("Test 2 — applescript argv round-trip")
-    script = 'on run argv\n\treturn item 1 of argv\nend run\n'
+    banner("Test 2 — applescript argv round-trip via a named script")
+    catalogue = server.applescript()
+    print("  catalogue:", json.dumps(catalogue["scripts"]))
+    print("  raw script text allowed:", catalogue["raw_allowed"])
     arg = 'quote " and em dash — and é and 🙂'
-    result = server.applescript(script=script, args=[arg])
+    result = server.applescript(name="echo-argv", args=[arg])
     print("  arg in :", repr(arg))
     print("  stdout :", repr(result["stdout"]))
     print("  exit   :", result["exit_code"], "stderr:", repr(result["stderr"]))
     ok = result["exit_code"] == 0 and result["stdout"] == arg
     record("2. applescript round-trip", ok,
-           "byte-exact" if ok else "argument did not survive the round-trip")
+           "byte-exact through scripts/echo-argv.applescript"
+           if ok else "argument did not survive the round-trip")
+
+
+def test_2b_raw_script_refused() -> None:
+    banner("Test 2b — model-authored script text is refused by default (A-001)")
+    result = server.applescript(script='on run argv\n\treturn do shell script "id -un"\nend run\n')
+    print("  applescript(script=...):", json.dumps(result, ensure_ascii=False)[:220])
+    ok = result.get("ok") is False and "raw AppleScript is disabled" in result.get("error", "")
+    record("2b. raw script refused", ok,
+           "refused, and the error names the catalogue instead"
+           if ok else "raw script text was NOT refused")
 
 
 # -- 3 -----------------------------------------------------------------------
@@ -121,7 +136,9 @@ def test_4_textedit_end_to_end() -> None:
     print("  TextEdit documents already open:", docs_before)
 
     try:
-        opened = server.applescript(script=TEXTEDIT_NEW)
+        # osa() is the internal primitive; the TextEdit scripts here are test
+        # fixtures, not part of the shipped catalogue.
+        opened = server.osa(TEXTEDIT_NEW, [])
         print("  applescript activate + new document:", json.dumps(opened))
         if opened["exit_code"] != 0:
             record("4. TextEdit end-to-end", False, f"could not open TextEdit: {opened['stderr']}")
@@ -224,6 +241,89 @@ def test_7_audit_log(start_line: int) -> None:
            if ok else f"expected act/applescript/notify/see, got {sorted(set(tools))}")
 
 
+# -- 8 -----------------------------------------------------------------------
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def _split_image(result):
+    """see() returns the payload dict alone, or [json_text, Image] with a capture."""
+    if isinstance(result, list) and len(result) == 2:
+        payload = result[0]
+        return (json.loads(payload) if isinstance(payload, str) else payload,
+                getattr(result[1], "data", None))
+    return result, None
+
+
+def _capture_dirs() -> set[str]:
+    """Scratch directories _screenshot() creates, which it must also remove."""
+    return {str(p) for p in Path(tempfile.gettempdir()).glob("mac-commander-*")}
+
+
+def test_8_vision() -> None:
+    banner("Test 8 — see(vision=True) captures, refuses and cleans up")
+    if not server.Quartz.CGPreflightScreenCaptureAccess():
+        detail = ("Screen Recording is not granted to the process running this "
+                  "script, so the capture path cannot execute. Grant it in System "
+                  "Settings > Privacy & Security > Screen & System Audio Recording "
+                  "and re-run. Note the permission belongs to the host app (e.g. "
+                  "Terminal), not to python itself.")
+        for name in ("8. vision capture", "8b. vision blocklist refusal"):
+            record(name, None, detail)
+        return
+
+    pre_existing = _capture_dirs()
+
+    # 8 — a windowed app yields a real PNG of that window alone.
+    snapshot, png = _split_image(server.see(app="Finder", vision=True))
+    notes = snapshot.get("notes", [])
+    print("  scope:", snapshot.get("scope"), "| elements:", snapshot.get("elements_returned"))
+    print("  notes:", json.dumps(notes, ensure_ascii=False))
+    if png is None:
+        # Finder with no window on screen is a legitimate state, and the server
+        # is required to say so rather than substitute a whole-screen grab.
+        record("8. vision capture", None,
+               "no image returned — " + ("; ".join(notes) if notes else "no reason given")
+               + ". Open a Finder window and re-run to exercise the capture itself.")
+    else:
+        print(f"  image: {len(png)} bytes, magic {png[:8]!r}")
+        ok = png.startswith(PNG_MAGIC) and len(png) > len(PNG_MAGIC)
+        record("8. vision capture", ok,
+               f"{len(png)} bytes of valid PNG for Finder's window. That the pixels "
+               "show the right window is a human observation this script cannot make."
+               if ok else f"returned {len(png)} bytes that are not a PNG")
+
+    # 8b — a blocklisted target loses the bitmap but keeps the element tree.
+    # No password manager is guaranteed to be running, so Finder is blocklisted
+    # for the length of this check and the real config is put back afterwards.
+    original = list(server.CONFIG.get("input_blocklist") or [])
+    try:
+        server.CONFIG["input_blocklist"] = original + ["Finder"]
+        snapshot, png = _split_image(server.see(app="Finder", vision=True))
+    finally:
+        server.CONFIG["input_blocklist"] = original
+    notes = snapshot.get("notes", [])
+    elements = snapshot.get("elements_returned", 0)
+    print("  blocklist in force:", json.dumps(original + ["Finder"]))
+    print("  notes:", json.dumps(notes, ensure_ascii=False))
+    print("  elements still returned:", elements)
+    print("  blocklist restored:", server.CONFIG["input_blocklist"] == original)
+    ok = (png is None
+          and any("no screenshot" in str(n) for n in notes)
+          and elements > 0
+          and server.CONFIG["input_blocklist"] == original)
+    record("8b. vision blocklist refusal", ok,
+           f"image withheld, {elements} elements still returned — reading a locked "
+           "vault stays allowed, writing its pixels out does not"
+           if ok else f"png={'present' if png else 'absent'} elements={elements} notes={notes}")
+
+    # 8c — a capture of the user's screen must not be left behind on disk.
+    leaked = sorted(_capture_dirs() - pre_existing)
+    print("  scratch dirs left by this test:", leaked or "none")
+    record("8c. no capture left on disk", not leaked,
+           f"no mac-commander-* scratch directory survives in {tempfile.gettempdir()}"
+           if not leaked else f"left behind: {leaked}")
+
+
 def main() -> int:
     print("Mac-Commander acceptance tests")
     print("Accessibility trusted for this process:", server.AS.AXIsProcessTrusted())
@@ -234,10 +334,13 @@ def main() -> int:
 
     test_1_notify()
     test_2_applescript_roundtrip()
+    test_2b_raw_script_refused()
     test_3_see_finder()
     test_4_textedit_end_to_end()
     test_5_blocklist()
     test_6_focus_abort_unit()
+    # 8 runs before 7 so its see() calls land in the range test 7 inspects.
+    test_8_vision()
     test_7_audit_log(start)
 
     banner("Summary")

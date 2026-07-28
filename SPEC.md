@@ -3,6 +3,23 @@
 v1.0 — 2026-07-27 — approved by Marty (Option A). Builder: Claude Code.
 This file is the contract; where chat memory and this file disagree, this file wins.
 
+> **Amendment v1.1 — 2026-07-27, authorised by Marty after the security audit.**
+> The `applescript` tool no longer accepts caller-supplied script text by
+> default. It runs user-authored scripts from `scripts/` by name, with values
+> still delivered as argv; raw script text requires
+> `"allow_raw_applescript": true` in config.json and is off by default.
+>
+> This supersedes the `applescript(script, args=[], timeout=30)` signature and
+> the "Pass the script through untouched" line below, and acceptance test 2
+> now round-trips through a named script. Reason: audit finding A-001 — the
+> tool was unrestricted same-user code execution while the server told the
+> driving model it "does not run shell commands". Both the in-house sweep and
+> the independent third-party auditor ranked it the top finding. Rationale and
+> the rejected alternatives are in [`AUDIT.md`](AUDIT.md).
+>
+> Still five tools. Still no interpolation. The size budget below is now
+> exceeded — see the Bigger picture section of AUDIT.md.
+
 ## What this is
 
 A minimal macOS GUI-automation MCP server. It fully replaces the third-party
@@ -120,6 +137,12 @@ Return stdout, stderr, exit code.
 6. Focus-abort path: unit test with mocked frontmost flipping mid-batch →
    asserts abort and correct failed_step.
 7. tail audit.jsonl → one line per call above.
+8. see(vision=true) on a windowed app → a real PNG of that window; on a
+   blocklisted app → the element tree with the image withheld and a note saying
+   so; and no capture left behind in the temp directory afterwards. Needs the
+   Screen Recording grant, which belongs to the host app running the script
+   (e.g. Terminal), not to python — without it this test reports UNVERIFIED
+   rather than passing silently.
 
 ## Deliverables & final report
 
