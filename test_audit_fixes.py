@@ -294,3 +294,44 @@ def test_shipped_scripts_all_declare_an_argv_handler():
         text, error = server._named_script(n)
         assert error is None
         assert "on run argv" in text, f"{n} must take its values as argv"
+
+
+# -- Found 2026-07-27 while adding acceptance test 8: press_combo left the
+#    modifier logically held, so the next type_text() was eaten as a shortcut --
+
+def _record_posted_events(monkeypatch) -> list[dict]:
+    """Capture what press_combo would post, without firing any real input."""
+    posted: list[dict] = []
+    monkeypatch.setattr(server.Quartz, "CGEventCreateKeyboardEvent",
+                        lambda src, code, down: {"code": code, "down": down, "flags": 0})
+    monkeypatch.setattr(server.Quartz, "CGEventSetFlags",
+                        lambda event, flags: event.__setitem__("flags", flags))
+    monkeypatch.setattr(server.Quartz, "CGEventPost",
+                        lambda tap, event: posted.append(dict(event)))
+    monkeypatch.setattr(server.time, "sleep", lambda _seconds: None)
+    return posted
+
+
+@pytest.mark.parametrize("combo", ["cmd+c", "cmd+a", "shift+9", "cmd+shift+4"])
+def test_press_combo_releases_its_modifiers(monkeypatch, combo):
+    """The last event posted must carry no flags.
+
+    The key-up carries the modifier flags too, so without an explicit release
+    the modifier stays held in the session's flag state and the *next*
+    type_text() is read as a shortcut and silently dropped — a cmd+c ending one
+    act() batch ate the typing in the following batch.
+    """
+    posted = _record_posted_events(monkeypatch)
+    server.press_combo(combo)
+    assert posted, "press_combo posted nothing"
+    assert posted[-1]["flags"] == 0, (
+        f"{combo} left flags 0x{posted[-1]['flags']:x} held; the next "
+        "type_text() would be swallowed as a shortcut")
+
+
+def test_press_combo_without_modifiers_posts_no_extra_event(monkeypatch):
+    """A plain key needs no release, so it stays at exactly key-down + key-up."""
+    posted = _record_posted_events(monkeypatch)
+    server.press_combo("return")
+    assert [e["down"] for e in posted] == [True, False]
+    assert all(e["flags"] == 0 for e in posted)

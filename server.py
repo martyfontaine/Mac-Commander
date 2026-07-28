@@ -432,6 +432,17 @@ def press_combo(combo: str) -> None:
         Quartz.CGEventSetFlags(event, flags)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
         time.sleep(0.012)
+    if flags:
+        # The key-up above carries the modifier flags too, which leaves the
+        # modifier logically held in the session's flag state. Unicode text
+        # posted afterwards is then read as a shortcut and swallowed — a cmd+c
+        # at the end of one act() batch silently eats the typing in the next.
+        # Physical key presses reset this, which is why it only bites unattended
+        # runs. Post one flags-cleared event to release it.
+        release = Quartz.CGEventCreateKeyboardEvent(_SRC, 0, False)
+        Quartz.CGEventSetFlags(release, 0)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, release)
+        time.sleep(0.012)
 
 
 def _post_mouse(kind, x: float, y: float, button, click_state: int = 1) -> None:
