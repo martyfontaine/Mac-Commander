@@ -14,6 +14,7 @@ Two rules shape every line below:
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -50,6 +51,12 @@ DEFAULT_CONFIG = {
     # `do shell script` and is bound by neither the blocklist nor the focus
     # guard. Scripts in scripts/ are written by the user and run by name.
     "allow_raw_applescript": False,
+    # The halo: for exactly as long as a tool call is executing, overlay.py
+    # shows a rose-gold glow around every screen and "Claude has the con" at
+    # the bottom centre — lit at call start, dropped the moment the call
+    # returns. Cosmetic and click-through — it can never intercept input or
+    # break a tool call.
+    "overlay": True,
 }
 
 
@@ -687,6 +694,84 @@ def _summarize(steps: list) -> str:
 
 
 # --------------------------------------------------------------------------
+# Overlay — the on-screen "Claude has the con" halo
+# --------------------------------------------------------------------------
+
+_overlay_proc: subprocess.Popen | None = None
+_overlay_spawns = 0
+MAX_OVERLAY_SPAWNS = 5  # a helper that keeps dying at startup stops being retried
+
+
+def overlay_ping() -> None:
+    """Light the halo: tell overlay.py the desktop is being driven right now.
+
+    The overlay lives in its own process because this server has no run loop
+    between tool calls — a window shown here could never fade itself out after
+    the last call — and because keeping AppKit windows out of this process
+    keeps the input path small and auditable. The helper hides itself after a
+    quiet period and exits on stdin EOF, so it cannot outlive the server.
+
+    Cosmetic only, so it must never break a tool call: every failure is
+    swallowed. A helper that died is respawned on the next ping, a bounded
+    number of times.
+    """
+    global _overlay_proc, _overlay_spawns
+    if not CONFIG.get("overlay", True):
+        return
+    try:
+        if _overlay_proc is not None and _overlay_proc.poll() is not None:
+            _overlay_proc = None  # helper exited; reap it and start fresh
+        if _overlay_proc is None:
+            if _overlay_spawns >= MAX_OVERLAY_SPAWNS:
+                return
+            _overlay_spawns += 1
+            _overlay_proc = subprocess.Popen(
+                [sys.executable, str(ROOT / "overlay.py")],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        _overlay_proc.stdin.write(b"ping\n")
+        _overlay_proc.stdin.flush()
+    except OSError as exc:
+        if _overlay_proc is None:  # Popen itself failed: overlay.py missing or unrunnable
+            _overlay_spawns = MAX_OVERLAY_SPAWNS
+            print(f"mac-commander: overlay disabled: {exc}", file=sys.stderr)
+        else:  # the pipe broke mid-write; drop the handle and respawn next ping
+            _overlay_proc = None
+
+
+def overlay_hide() -> None:
+    """Drop the halo: the tool call is over. Never spawns — a helper that is
+    not already up has nothing to hide."""
+    global _overlay_proc
+    if _overlay_proc is None or _overlay_proc.poll() is not None:
+        return
+    try:
+        _overlay_proc.stdin.write(b"hide\n")
+        _overlay_proc.stdin.flush()
+    except OSError:
+        _overlay_proc = None  # broken pipe; the next ping respawns
+
+
+def lit(fn):
+    """Run a tool with the halo lit for exactly the duration of the call.
+
+    Applied under @mcp.tool(), so FastMCP registers the wrapper;
+    functools.wraps preserves the signature and docstring it reads for the
+    tool schema. The finally guarantees the halo drops on every exit path,
+    including exceptions — a lit halo with no call running would be a lie.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        overlay_ping()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            overlay_hide()
+    return wrapper
+
+
+# --------------------------------------------------------------------------
 # Tools
 # --------------------------------------------------------------------------
 
@@ -712,6 +797,7 @@ mcp = FastMCP(
 
 
 @mcp.tool()
+@lit
 def see(app: str | None = None, all: bool = False, vision: bool = False,
         max_elements: int = 150) -> Any:
     """Look at what is on screen in a macOS app — read its windows, buttons,
@@ -844,6 +930,7 @@ def _screenshot(running) -> tuple[bytes | None, str | None]:
 
 
 @mcp.tool()
+@lit
 def act(target: str, steps: list[dict], settle_ms: int = 150) -> dict:
     """Control a macOS app — click buttons, type text, press keyboard
     shortcuts, scroll and drag — as one atomic, focus-guarded batch.
@@ -972,6 +1059,7 @@ def _place_window(pid: int, window: dict) -> str:
 
 
 @mcp.tool()
+@lit
 def app(action: str, name: str, window: dict | None = None) -> dict:
     """Launch, quit, switch to or hide a macOS application, and move or resize
     its window.
@@ -1070,6 +1158,7 @@ def app(action: str, name: str, window: dict | None = None) -> dict:
 
 
 @mcp.tool()
+@lit
 def notify(message: str, title: str = "Mac-Commander", subtitle: str | None = None,
            sound: str | None = None) -> dict:
     """Show a macOS notification banner to get the user's attention.
@@ -1085,6 +1174,7 @@ def notify(message: str, title: str = "Mac-Commander", subtitle: str | None = No
 
 
 @mcp.tool()
+@lit
 def applescript(name: str | None = None, script: str | None = None,
                 args: list[str] | None = None, timeout: int = 30) -> dict:
     """Run one of the user's AppleScripts by name — for anything the other

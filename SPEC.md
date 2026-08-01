@@ -20,6 +20,17 @@ This file is the contract; where chat memory and this file disagree, this file w
 > Still five tools. Still no interpolation. The size budget below is now
 > exceeded — see the Bigger picture section of AUDIT.md.
 
+> **Amendment v1.2 — 2026-08-01, requested by Marty.**
+> A visual indicator was added: for exactly as long as a tool call is
+> executing, a helper process (`overlay.py`, spawned by the server, told
+> "ping" at call start and "hide" at call end — two fixed words, nothing
+> else) shows a rose-gold halo around every screen and "Claude has the con"
+> at the bottom centre, and exits with the server. Not a sixth tool — the
+> model cannot call, steer, or restyle it. Its windows are click-through and
+> never take key focus, so the focus guard and the input path are
+> unaffected. Config key: `"overlay"` (default true). The hermetic tests
+> disable it via conftest.py.
+
 ## What this is
 
 A minimal macOS GUI-automation MCP server. It fully replaces the third-party
