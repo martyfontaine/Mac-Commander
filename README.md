@@ -1,6 +1,7 @@
 # Mac-Commander
 
-A minimal macOS GUI-automation MCP server. Five tools, one file.
+A minimal macOS GUI-automation MCP server. Five tools, one file — plus a
+cosmetic overlay helper that shows when the server is at the controls.
 
 It replaces the third-party **MacOS-MCP** server. Four of its five tools —
 `see`, `act`, `app`, `notify` — do **not** read or write files and do not run
@@ -125,6 +126,30 @@ values from there.
 Passing `script=` instead is refused unless `config.json` sets
 `"allow_raw_applescript": true`.
 
+## The halo — "Claude has the con"
+
+For exactly as long as a tool call is executing, `overlay.py` shows a
+rose-gold glow around every screen edge and a pill at the bottom centre of
+the main screen reading **"Claude has the con"**. The halo rises when a call
+starts and drops the moment it returns — a quick `see()` is a brief shimmer,
+a long `act()` batch stays lit throughout, and back-to-back calls blend into
+one sustained glow. It vanishes entirely when the server exits.
+
+It is a separate helper process because it keeps AppKit windows out of the
+audited input path, and because a window drawn by the server itself could
+never animate between tool calls — the server has no run loop of its own.
+The server writes one of two fixed words ("ping" at call start, "hide" at
+call end) down a pipe; the helper draws. The model cannot call, steer, or
+restyle it.
+
+Its windows are click-through (`ignoresMouseEvents`) and never take key
+focus, so the halo can neither swallow the clicks the server posts nor steal
+the keyboard it is reporting on. One honest side effect: a whole-desktop
+`see(all=true, vision=true)` screenshot includes the glow, because it really
+is on screen. Window-scoped captures do not.
+
+`"overlay": false` in `config.json` turns it off.
+
 ## Why AppleScript is never interpolated
 
 The server it replaces built AppleScript by pasting user strings into
@@ -155,7 +180,8 @@ on stdin, values on argv, nothing interpolated. That is what `osa()` runs.
     "System Settings", "com.apple.systempreferences",
     "Keychain Access", "com.apple.keychainaccess"
   ],
-  "audit_log": "audit.jsonl"
+  "audit_log": "audit.jsonl",
+  "overlay": true
 }
 ```
 
