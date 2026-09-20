@@ -3,8 +3,12 @@
 
 server.py spawns this helper the first time a tool touches the desktop,
 writes "ping" to its stdin when a tool call starts and "hide" when the call
-returns, so the halo is lit for exactly as long as the server is actually
-driving the machine. A ping fades in one click-through, borderless window
+returns. A ping lights the halo at once; a hide starts a LINGER countdown,
+and only when that runs out with no new ping does the halo fade. So a burst
+of tool calls with thinking gaps between them reads as one sustained glow —
+"Claude has the con" for the whole job — rather than a strobe on every call.
+
+A ping fades in one click-through, borderless window
 per screen: a rose-gold glow around the screen edges, plus a small pill at
 the bottom centre of the main screen reading "Claude has the con". EOF on
 stdin — the server exiting, however it exits — quits the helper, so the
@@ -33,6 +37,8 @@ from Foundation import NSMakePoint, NSMakeRect, NSObject
 
 LABEL = "Claude has the con"
 GLOW = 36.0  # how far the halo bleeds inward from each screen edge, in points
+LINGER = 15.0  # seconds the halo stays lit after the last "hide" before fading;
+               # a "ping" inside this window cancels the fade. Tune to taste.
 
 
 def _rose(r: float, g: float, b: float, a: float):
@@ -100,6 +106,7 @@ class Overlay(NSObject):
             return None
         self.windows = []
         self.fade_timer = None
+        self.linger_timer = None  # one-shot countdown armed by hideCmd, disarmed by pingCmd
         self.fade_from = 0.0
         self.fade_target = 0.0
         self.fade_step = 0
@@ -160,14 +167,30 @@ class Overlay(NSObject):
         if not self.ready:
             self.pending = True
             return
+        self._disarm_linger()  # a new call landed inside the quiet period: stay lit
         self._fade(1.0, 0.25, order_front=True)
 
     def hideCmd(self):
-        # A slightly slower fade-out than in: back-to-back tool calls retarget
-        # the fade mid-flight, so a busy burst reads as one sustained glow
-        # rather than a strobe.
+        # Don't fade yet. Arm a one-shot countdown; if no ping arrives before
+        # it fires, lingerFired_ does the fade-out. Back-to-back calls with
+        # thinking gaps between them therefore read as one sustained glow.
         self.pending = False
+        self._disarm_linger()
+        self.linger_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            LINGER, self, "lingerFired:", None, False)
+
+    def lingerFired_(self, timer):
+        # The quiet period ran out with no new ping: the job is over.
+        self.linger_timer = None
+        # A slightly slower fade-out than in, so the drop reads as a settle,
+        # not a snap.
         self._fade(0.0, 0.6)
+
+    @objc.python_method
+    def _disarm_linger(self):
+        if self.linger_timer is not None:
+            self.linger_timer.invalidate()
+            self.linger_timer = None
 
     def screensChanged_(self, note):
         was_visible = any(win.alphaValue() > 0 for win in self.windows)
