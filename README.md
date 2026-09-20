@@ -19,8 +19,17 @@ Built to spec: [`SPEC.md`](SPEC.md) v1.0.
 
 ## Wiring it into Claude Desktop
 
-Add this to `~/Library/Application Support/Claude/claude_desktop_config.json`
-inside the existing `"mcpServers"` object, then quit and reopen Claude Desktop:
+Add an entry like this to
+`~/Library/Application Support/Claude/claude_desktop_config.json`, inside the
+existing `"mcpServers"` object, with both paths pointing at your clone. Then
+quit and reopen Claude Desktop:
+
+```json
+"mac-commander": {
+  "command": "/path/to/Mac-Commander/.venv/bin/python",
+  "args": ["/path/to/Mac-Commander/server.py"]
+}
+```
 
 Remove the old `MacOS-MCP` entry at the same time — running both means two
 things fighting over the same keyboard.
@@ -123,24 +132,37 @@ Adding a script is dropping a `.applescript` file in `scripts/` — no restart,
 the catalogue is read per call. Write it with an `on run argv` handler and read
 values from there.
 
+What ships in `scripts/`:
+
+| script | does |
+| --- | --- |
+| `clipboard-read` | the clipboard as text, or `""` if it holds something non-textual |
+| `clipboard-write` | sets the clipboard to `argv[1]` |
+| `echo-argv` | returns `argv[1]` unchanged — the round-trip proof that quotes, em dashes, accents and emoji survive the stdin+argv path |
+| `finder-selection` | POSIX paths of the current Finder selection, one per line |
+| `front-tab` | title and URL of the active tab in Vivaldi or Google Chrome, two lines. `argv[1]` optionally names the browser; with none, the frontmost wins, falling back to whichever is running. Never launches one. |
+
 Passing `script=` instead is refused unless `config.json` sets
 `"allow_raw_applescript": true`.
 
 ## The halo — "Claude has the con"
 
-For exactly as long as a tool call is executing, `overlay.py` shows a
-rose-gold glow around every screen edge and a pill at the bottom centre of
-the main screen reading **"Claude has the con"**. The halo rises when a call
-starts and drops the moment it returns — a quick `see()` is a brief shimmer,
-a long `act()` batch stays lit throughout, and back-to-back calls blend into
-one sustained glow. It vanishes entirely when the server exits.
+While the server is at the controls, `overlay.py` shows a rose-gold glow
+around every screen edge and a pill at the bottom centre of the main screen
+reading **"Claude has the con"**. The halo rises the moment a call starts.
+When the call returns it does not drop at once: a 15-second linger begins,
+and any call that lands inside it keeps the glow up. So a job made of several
+calls with thinking gaps between them reads as one sustained glow — not a
+strobe on every `see()` — and the halo fades only once the machine has been
+left alone for the full linger. It vanishes entirely when the server exits.
+`LINGER` at the top of `overlay.py` is the one knob.
 
 It is a separate helper process because it keeps AppKit windows out of the
 audited input path, and because a window drawn by the server itself could
 never animate between tool calls — the server has no run loop of its own.
 The server writes one of two fixed words ("ping" at call start, "hide" at
-call end) down a pipe; the helper draws. The model cannot call, steer, or
-restyle it.
+call end) down a pipe; the helper draws, and the helper alone decides when
+to fade. The model cannot call, steer, or restyle it.
 
 Its windows are click-through (`ignoresMouseEvents`) and never take key
 focus, so the halo can neither swallow the clicks the server posts nor steal
